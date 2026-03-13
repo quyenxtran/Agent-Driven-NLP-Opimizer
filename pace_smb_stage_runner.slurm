@@ -13,6 +13,7 @@
 # export SMB_TSTEP_LIBRARY='8.5,9.5,10.5'
 # sbatch --export=ALL,SMB_STAGE=flow-screen,SMB_RUN_NAME=flow_smoke,SMB_LINEAR_SOLVER=mumps AutoResearch-SMB/pace_smb_stage_runner.slurm
 # export SMB_NC_LIBRARY='1,2,3,2;2,2,2,2;1,3,2,2'
+# export SMB_SEED_LIBRARY='notebook'
 # sbatch --export=ALL,SMB_STAGE=optimize-layouts,SMB_RUN_NAME=minlp_baseline,SMB_LINEAR_SOLVER=mumps AutoResearch-SMB/pace_smb_stage_runner.slurm
 #
 # Override account, partition, or time at submit time if needed:
@@ -149,6 +150,7 @@ SMB_F1_BOUNDS="${SMB_F1_BOUNDS:-1.5,2.5}"
 SMB_MEOH_MAX_RAFF_WT="${SMB_MEOH_MAX_RAFF_WT:-0.10}"
 SMB_WATER_MAX_EX_WT="${SMB_WATER_MAX_EX_WT:-0.05}"
 SMB_WATER_MAX_ZONE1_ENTRY_WT="${SMB_WATER_MAX_ZONE1_ENTRY_WT:-0.01}"
+SMB_SEED_LIBRARY="${SMB_SEED_LIBRARY:-notebook}"
 SMB_STAGE_TEE="${SMB_STAGE_TEE:-0}"
 
 STAGE_ARGS=(
@@ -184,6 +186,7 @@ STAGE_ARGS=(
   --meoh-max-raff-wt "${SMB_MEOH_MAX_RAFF_WT}"
   --water-max-ex-wt "${SMB_WATER_MAX_EX_WT}"
   --water-max-zone1-entry-wt "${SMB_WATER_MAX_ZONE1_ENTRY_WT}"
+  --seed-library "${SMB_SEED_LIBRARY}"
 )
 
 if [[ -n "${SMB_LINEAR_SOLVER}" ]]; then
@@ -209,6 +212,7 @@ echo "nc library: ${SMB_NC_LIBRARY}"
 echo "flows: Ffeed=${SMB_FFEED}, F1=${SMB_F1}, Fdes=${SMB_FDES}, Fex=${SMB_FEX}, tstep=${SMB_TSTEP}"
 echo "flow libraries: Ffeed=${SMB_FFEED_LIBRARY} | F1=${SMB_F1_LIBRARY} | Fdes=${SMB_FDES_LIBRARY} | Fex=${SMB_FEX_LIBRARY} | tstep=${SMB_TSTEP_LIBRARY}"
 echo "optimization bounds: tstep=${SMB_TSTEP_BOUNDS} | Ffeed=${SMB_FFEED_BOUNDS} | F1=${SMB_F1_BOUNDS} | Fdes=${SMB_FDES_BOUNDS} | Fex=${SMB_FEX_BOUNDS} | Fraf=${SMB_FRAF_BOUNDS}"
+echo "seed library: ${SMB_SEED_LIBRARY}"
 echo "fidelity: nfex=${SMB_NFEX}, nfet=${SMB_NFET}, ncp=${SMB_NCP}"
 
 cd "${REPO_ROOT}"

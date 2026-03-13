@@ -26,6 +26,16 @@ REFERENCE_LAYOUT = (1, 2, 3, 2)
 REFERENCE_WT0 = (0.003, 0.004, 0.990, 0.003)
 REFERENCE_RHO = (1.5, 1.6, 1.0, 0.79)
 REFERENCE_KAPP = (0.8, 1.22, 1.0, 0.69)
+NOTEBOOK_SEEDS = [
+    {"name": "reference", "F1": 2.2, "Fdes": 1.2, "Fex": 0.9, "Ffeed": 1.3, "Fraf": 1.6, "tstep": 9.4},
+    {"name": "optimized_a", "F1": 3.6, "Fdes": 2.0, "Fex": 1.9, "Ffeed": 2.4, "Fraf": 2.5, "tstep": 8.0},
+    {"name": "optimized_a_minus", "F1": 3.6, "Fdes": 2.0, "Fex": 1.9, "Ffeed": 2.35, "Fraf": 2.45, "tstep": 8.0},
+    {"name": "optimized_a_plus", "F1": 3.6, "Fdes": 2.0, "Fex": 1.9, "Ffeed": 2.45, "Fraf": 2.55, "tstep": 8.0},
+    {"name": "optimized_b", "F1": 3.7, "Fdes": 2.0, "Fex": 1.9, "Ffeed": 2.4, "Fraf": 2.5, "tstep": 8.0},
+    {"name": "optimized_c", "F1": 3.5, "Fdes": 2.0, "Fex": 1.9, "Ffeed": 2.4, "Fraf": 2.5, "tstep": 8.0},
+    {"name": "optimized_2f1", "F1": 3.4, "Fdes": 1.9, "Fex": 1.7, "Ffeed": 2.5, "Fraf": 2.7, "tstep": 8.0},
+    {"name": "optimized_2f2", "F1": 3.5, "Fdes": 1.9, "Fex": 1.7, "Ffeed": 2.5, "Fraf": 2.7, "tstep": 8.0},
+]
 
 
 def parse_nc(raw: str) -> Tuple[int, int, int, int]:
@@ -81,6 +91,78 @@ def parse_bounds(raw: str | None) -> Tuple[float, float] | None:
     if lb > ub:
         raise ValueError(f"Lower bound must be <= upper bound, got {raw!r}")
     return (lb, ub)
+
+
+def parse_seed_library(raw: str) -> List[Dict[str, float | str]]:
+    value = raw.strip().lower()
+    if value in {"notebook", "kraton-notebook", "kraton_notebook"}:
+        return [dict(seed) for seed in NOTEBOOK_SEEDS]
+    seeds: List[Dict[str, float | str]] = []
+    for idx, part in enumerate(raw.split(";"), start=1):
+        text = part.strip()
+        if not text:
+            continue
+        numbers = parse_float_library(text)
+        if len(numbers) == 5:
+            f1, fdes, fex, ffeed, tstep = numbers
+            fraf = derive_fraf(ffeed, fdes, fex)
+        elif len(numbers) == 6:
+            f1, fdes, fex, ffeed, fraf, tstep = numbers
+        else:
+            raise ValueError(
+                "Each seed entry must contain either 5 floats "
+                "(F1,Fdes,Fex,Ffeed,tstep) or 6 floats (F1,Fdes,Fex,Ffeed,Fraf,tstep)."
+            )
+        seeds.append(
+            {
+                "name": f"seed_{idx:02d}",
+                "F1": f1,
+                "Fdes": fdes,
+                "Fex": fex,
+                "Ffeed": ffeed,
+                "Fraf": fraf,
+                "tstep": tstep,
+            }
+        )
+    if not seeds:
+        raise ValueError(f"Expected at least one seed entry, got {raw!r}")
+    return seeds
+
+
+def clip_to_bounds(value: float, bounds: Tuple[float, float] | None) -> float:
+    if bounds is None:
+        return value
+    return min(max(value, bounds[0]), bounds[1])
+
+
+def apply_seed_to_args(
+    args: argparse.Namespace,
+    seed: Dict[str, float | str],
+    *,
+    tstep_bounds: Tuple[float, float] | None,
+    ffeed_bounds: Tuple[float, float] | None,
+    fdes_bounds: Tuple[float, float] | None,
+    fex_bounds: Tuple[float, float] | None,
+    fraf_bounds: Tuple[float, float] | None,
+    f1_bounds: Tuple[float, float] | None,
+) -> argparse.Namespace:
+    candidate_args = argparse.Namespace(**vars(args))
+    candidate_args.seed_name = str(seed["name"])
+    candidate_args.seed_flow_original = {
+        "F1": float(seed["F1"]),
+        "Fdes": float(seed["Fdes"]),
+        "Fex": float(seed["Fex"]),
+        "Ffeed": float(seed["Ffeed"]),
+        "Fraf": float(seed["Fraf"]),
+        "tstep": float(seed["tstep"]),
+    }
+    candidate_args.f1 = clip_to_bounds(float(seed["F1"]), f1_bounds)
+    candidate_args.fdes = clip_to_bounds(float(seed["Fdes"]), fdes_bounds)
+    candidate_args.fex = clip_to_bounds(float(seed["Fex"]), fex_bounds)
+    candidate_args.ffeed = clip_to_bounds(float(seed["Ffeed"]), ffeed_bounds)
+    candidate_args.fraf = clip_to_bounds(float(seed["Fraf"]), fraf_bounds)
+    candidate_args.tstep = clip_to_bounds(float(seed["tstep"]), tstep_bounds)
+    return candidate_args
 
 
 def load_config(args: argparse.Namespace, nc: Sequence[int]) -> SMBConfig:
@@ -393,6 +475,8 @@ def evaluate_optimized_layout(args: argparse.Namespace, nc: Sequence[int]) -> Di
             "stage": args.stage,
             "run_name": args.run_name,
             "nc": list(nc),
+            "seed_name": getattr(args, "seed_name", None),
+            "seed_flow_original": getattr(args, "seed_flow_original", None),
             "initial_flow": {
                 "Ffeed": flow.Ffeed,
                 "F1": flow.F1,
@@ -445,6 +529,8 @@ def evaluate_optimized_layout(args: argparse.Namespace, nc: Sequence[int]) -> Di
         "stage": args.stage,
         "run_name": args.run_name,
         "nc": list(nc),
+        "seed_name": getattr(args, "seed_name", None),
+        "seed_flow_original": getattr(args, "seed_flow_original", None),
         "initial_flow": {
             "Ffeed": flow.Ffeed,
             "F1": flow.F1,
@@ -653,29 +739,49 @@ def run_flow_screen(args: argparse.Namespace) -> Dict[str, object]:
 
 def run_optimize_layouts(args: argparse.Namespace) -> Dict[str, object]:
     nc_library = parse_nc_library(args.nc_library)
+    tstep_bounds = parse_bounds(args.tstep_bounds)
+    ffeed_bounds = parse_bounds(args.ffeed_bounds)
+    fdes_bounds = parse_bounds(args.fdes_bounds)
+    fex_bounds = parse_bounds(args.fex_bounds)
+    fraf_bounds = parse_bounds(args.fraf_bounds)
+    f1_bounds = parse_bounds(args.f1_bounds)
+    seed_library = parse_seed_library(args.seed_library)
     results: List[Dict[str, object]] = []
     for nc in nc_library:
-        candidate_args = argparse.Namespace(**vars(args))
-        candidate_args.run_name = f"{args.run_name}_nc_{'-'.join(str(v) for v in nc)}"
-        try:
-            results.append(evaluate_optimized_layout(candidate_args, nc))
-        except Exception as exc:
-            results.append(
-                {
-                    "status": "error",
-                    "stage": args.stage,
-                    "run_name": candidate_args.run_name,
-                    "nc": list(nc),
-                    "error": str(exc),
-                    "traceback": traceback.format_exc(),
-                }
+        for seed in seed_library:
+            candidate_args = apply_seed_to_args(
+                args,
+                seed,
+                tstep_bounds=tstep_bounds,
+                ffeed_bounds=ffeed_bounds,
+                fdes_bounds=fdes_bounds,
+                fex_bounds=fex_bounds,
+                fraf_bounds=fraf_bounds,
+                f1_bounds=f1_bounds,
             )
+            candidate_args.run_name = f"{args.run_name}_nc_{'-'.join(str(v) for v in nc)}_{candidate_args.seed_name}"
+            try:
+                results.append(evaluate_optimized_layout(candidate_args, nc))
+            except Exception as exc:
+                results.append(
+                    {
+                        "status": "error",
+                        "stage": args.stage,
+                        "run_name": candidate_args.run_name,
+                        "nc": list(nc),
+                        "seed_name": candidate_args.seed_name,
+                        "seed_flow_original": candidate_args.seed_flow_original,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                )
     successful = [item for item in results if item.get("status") == "ok"]
     ranked = rank_results(successful) if successful else []
     return {
         "status": "ok",
         "stage": args.stage,
         "nc_library": [list(nc) for nc in nc_library],
+        "seed_library": seed_library,
         "results": results,
         "ranked_results": ranked,
         "best_result": ranked[0] if ranked else None,
@@ -744,6 +850,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--meoh-max-raff-wt", type=float, default=0.10)
     parser.add_argument("--water-max-ex-wt", type=float, default=0.05)
     parser.add_argument("--water-max-zone1-entry-wt", type=float, default=0.01)
+    parser.add_argument("--seed-library", default="notebook")
     return parser
 
 
