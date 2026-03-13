@@ -18,7 +18,7 @@
 #SBATCH --gres=gpu:rtx_6000:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --mail-user=qtran47@gatech.edu
@@ -141,7 +141,7 @@ export SMB_AGENT_1_ROLE="${SMB_AGENT_1_ROLE:-process_optimization_scientist}"
 export SMB_AGENT_2_NAME="${SMB_AGENT_2_NAME:-Scientist_B}"
 export SMB_AGENT_2_ROLE="${SMB_AGENT_2_ROLE:-skeptical_process_and_numerics_scientist}"
 export SMB_LOCAL_LLM_MODEL="${SMB_LOCAL_LLM_MODEL:-qwen3.5:9b}"
-export SMB_CPU_TASKS="${SMB_CPU_TASKS:-${SLURM_CPUS_PER_TASK:-12}}"
+export SMB_CPU_TASKS="${SMB_CPU_TASKS:-${SLURM_CPUS_PER_TASK:-6}}"
 export SMB_GPU_COUNT="${SMB_GPU_COUNT:-${SMB_GPU_COUNT_COMPUTED}}"
 export SMB_GPU_MODEL="${SMB_GPU_MODEL:-rtx_6000}"
 export SMB_MEMORY_GB="${SMB_MEMORY_GB:-${SMB_MEMORY_GB_COMPUTED}}"
