@@ -16,19 +16,6 @@ SMB_ROOT = REPO_ROOT / "SembaSMB"
 if str(SMB_ROOT) not in sys.path:
     sys.path.insert(0, str(SMB_ROOT))
 
-from src import (  # type: ignore
-    SMBConfig,
-    FlowRates,
-    apply_discretization,
-    build_inputs,
-    build_model,
-    compute_outlet_averages,
-    compute_purity_recovery,
-    default_ipopt_options,
-    solve_model,
-)
-from src.smb_solver import check_solver_available  # type: ignore
-
 
 REFERENCE_LAYOUT = (1, 2, 3, 2)
 REFERENCE_WT0 = (0.003, 0.004, 0.990, 0.003)
@@ -70,6 +57,8 @@ def derive_fraf(ffeed: float, fdes: float, fex: float) -> float:
 
 
 def load_config(args: argparse.Namespace, nc: Sequence[int]) -> SMBConfig:
+    from src import SMBConfig  # type: ignore
+
     return SMBConfig(
         nc=tuple(nc),
         nfex=args.nfex,
@@ -96,6 +85,8 @@ def load_config(args: argparse.Namespace, nc: Sequence[int]) -> SMBConfig:
 
 
 def build_flow(args: argparse.Namespace) -> FlowRates:
+    from src import FlowRates  # type: ignore
+
     fraf = args.fraf if args.fraf is not None else derive_fraf(args.ffeed, args.fdes, args.fex)
     return FlowRates(
         F1=args.f1,
@@ -109,6 +100,8 @@ def build_flow(args: argparse.Namespace) -> FlowRates:
 
 
 def resolve_solver_name(requested: str) -> str:
+    from src.smb_solver import check_solver_available  # type: ignore
+
     if requested != "auto":
         return requested
     if check_solver_available("ipopt_sens"):
@@ -122,6 +115,8 @@ def resolve_solver_name(requested: str) -> str:
 
 
 def build_solver_options(args: argparse.Namespace) -> Dict[str, object]:
+    from src import default_ipopt_options  # type: ignore
+
     options: Dict[str, object] = default_ipopt_options()
     if args.linear_solver:
         options["linear_solver"] = args.linear_solver
@@ -174,6 +169,15 @@ def normalized_constraint_violation(metrics: Dict[str, float], flow: FlowRates, 
 
 
 def evaluate_candidate(args: argparse.Namespace, nc: Sequence[int]) -> Dict[str, object]:
+    from src import (  # type: ignore
+        apply_discretization,
+        build_inputs,
+        build_model,
+        compute_outlet_averages,
+        compute_purity_recovery,
+        solve_model,
+    )
+
     solver_name = resolve_solver_name(args.solver_name)
     solver_options = build_solver_options(args)
     config = load_config(args, nc)
@@ -242,6 +246,8 @@ def evaluate_candidate(args: argparse.Namespace, nc: Sequence[int]) -> Dict[str,
 
 
 def run_solver_check(args: argparse.Namespace) -> Dict[str, object]:
+    from src.smb_solver import check_solver_available  # type: ignore
+
     candidates = parse_solver_candidates(args.solver_candidates)
     solver_reports = {}
     for solver_name in candidates:
