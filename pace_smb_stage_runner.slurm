@@ -6,6 +6,12 @@
 # sbatch --export=ALL,SMB_STAGE=reference-eval,SMB_RUN_NAME=reference_hi_fi AutoResearch-SMB/pace_smb_stage_runner.slurm
 # sbatch --export=ALL,SMB_STAGE=reference-eval,SMB_NFEX=6,SMB_NFET=3,SMB_NCP=2,SMB_RUN_NAME=reference_med_fi AutoResearch-SMB/pace_smb_stage_runner.slurm
 # sbatch --export=ALL,SMB_STAGE=nc-screen,SMB_NC_LIBRARY="1,2,3,2;2,2,2,2;1,3,2,2",SMB_RUN_NAME=nc_smoke AutoResearch-SMB/pace_smb_stage_runner.slurm
+# export SMB_FFEED_LIBRARY='1.0,1.2,1.4'
+# export SMB_F1_LIBRARY='1.6,1.8,2.0'
+# export SMB_FDES_LIBRARY='0.8,1.0,1.2'
+# export SMB_FEX_LIBRARY='0.6,0.8,1.0'
+# export SMB_TSTEP_LIBRARY='8.5,9.5,10.5'
+# sbatch --export=ALL,SMB_STAGE=flow-screen,SMB_RUN_NAME=flow_smoke,SMB_LINEAR_SOLVER=mumps AutoResearch-SMB/pace_smb_stage_runner.slurm
 #
 # Override account, partition, or time at submit time if needed:
 # sbatch --account=gts-sn73 --qos=inferno --partition=cpu-amd --time=08:00:00 --export=ALL,SMB_STAGE=reference-eval AutoResearch-SMB/pace_smb_stage_runner.slurm
@@ -120,6 +126,11 @@ SMB_FEX="${SMB_FEX:-0.9}"
 SMB_FFEED="${SMB_FFEED:-1.3}"
 SMB_FRAF="${SMB_FRAF:-}"
 SMB_TSTEP="${SMB_TSTEP:-9.4}"
+SMB_F1_LIBRARY="${SMB_F1_LIBRARY:-$SMB_F1}"
+SMB_FDES_LIBRARY="${SMB_FDES_LIBRARY:-$SMB_FDES}"
+SMB_FEX_LIBRARY="${SMB_FEX_LIBRARY:-$SMB_FEX}"
+SMB_FFEED_LIBRARY="${SMB_FFEED_LIBRARY:-$SMB_FFEED}"
+SMB_TSTEP_LIBRARY="${SMB_TSTEP_LIBRARY:-$SMB_TSTEP}"
 SMB_NFEX="${SMB_NFEX:-10}"
 SMB_NFET="${SMB_NFET:-5}"
 SMB_NCP="${SMB_NCP:-2}"
@@ -141,6 +152,11 @@ STAGE_ARGS=(
   --fex "${SMB_FEX}"
   --ffeed "${SMB_FFEED}"
   --tstep "${SMB_TSTEP}"
+  --f1-library "${SMB_F1_LIBRARY}"
+  --fdes-library "${SMB_FDES_LIBRARY}"
+  --fex-library "${SMB_FEX_LIBRARY}"
+  --ffeed-library "${SMB_FFEED_LIBRARY}"
+  --tstep-library "${SMB_TSTEP_LIBRARY}"
   --nfex "${SMB_NFEX}"
   --nfet "${SMB_NFET}"
   --ncp "${SMB_NCP}"
@@ -171,6 +187,7 @@ echo "Artifact dir: ${ARTIFACT_DIR}"
 echo "nc: ${SMB_NC}"
 echo "nc library: ${SMB_NC_LIBRARY}"
 echo "flows: Ffeed=${SMB_FFEED}, F1=${SMB_F1}, Fdes=${SMB_FDES}, Fex=${SMB_FEX}, tstep=${SMB_TSTEP}"
+echo "flow libraries: Ffeed=${SMB_FFEED_LIBRARY} | F1=${SMB_F1_LIBRARY} | Fdes=${SMB_FDES_LIBRARY} | Fex=${SMB_FEX_LIBRARY} | tstep=${SMB_TSTEP_LIBRARY}"
 echo "fidelity: nfex=${SMB_NFEX}, nfet=${SMB_NFET}, ncp=${SMB_NCP}"
 
 cd "${REPO_ROOT}"

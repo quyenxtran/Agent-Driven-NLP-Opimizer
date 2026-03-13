@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import traceback
+from itertools import product
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -56,6 +57,13 @@ def generate_all_layouts(total_cols: int = 8, zones: int = 4) -> Iterable[Tuple[
 
 def derive_fraf(ffeed: float, fdes: float, fex: float) -> float:
     return ffeed + fdes - fex
+
+
+def parse_float_library(raw: str) -> List[float]:
+    values = [float(part.strip()) for part in raw.split(",") if part.strip()]
+    if not values:
+        raise ValueError(f"Expected at least one comma-separated float, got {raw!r}")
+    return values
 
 
 def load_config(args: argparse.Namespace, nc: Sequence[int]) -> SMBConfig:
@@ -390,6 +398,74 @@ def run_nc_screen(args: argparse.Namespace) -> Dict[str, object]:
     }
 
 
+def run_flow_screen(args: argparse.Namespace) -> Dict[str, object]:
+    nc = parse_nc(args.nc)
+    flow_grid = {
+        "ffeed": parse_float_library(args.ffeed_library),
+        "f1": parse_float_library(args.f1_library),
+        "fdes": parse_float_library(args.fdes_library),
+        "fex": parse_float_library(args.fex_library),
+        "tstep": parse_float_library(args.tstep_library),
+    }
+    results: List[Dict[str, object]] = []
+
+    for idx, (ffeed, f1, fdes, fex, tstep) in enumerate(
+        product(
+            flow_grid["ffeed"],
+            flow_grid["f1"],
+            flow_grid["fdes"],
+            flow_grid["fex"],
+            flow_grid["tstep"],
+        ),
+        start=1,
+    ):
+        candidate_args = argparse.Namespace(**vars(args))
+        candidate_args.ffeed = ffeed
+        candidate_args.f1 = f1
+        candidate_args.fdes = fdes
+        candidate_args.fex = fex
+        candidate_args.tstep = tstep
+        candidate_args.fraf = args.fraf if args.fraf is not None else derive_fraf(ffeed, fdes, fex)
+        candidate_args.run_name = (
+            f"{args.run_name}_pt_{idx:03d}"
+            f"_ffeed_{ffeed:g}_f1_{f1:g}_fdes_{fdes:g}_fex_{fex:g}_t_{tstep:g}"
+        )
+        try:
+            results.append(evaluate_candidate(candidate_args, nc))
+        except Exception as exc:
+            results.append(
+                {
+                    "status": "error",
+                    "stage": args.stage,
+                    "run_name": candidate_args.run_name,
+                    "nc": list(nc),
+                    "flow": {
+                        "Ffeed": ffeed,
+                        "F1": f1,
+                        "Fdes": fdes,
+                        "Fex": fex,
+                        "Fraf": candidate_args.fraf,
+                        "tstep": tstep,
+                    },
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+
+    successful = [item for item in results if item.get("status") == "ok"]
+    ranked = rank_results(successful) if successful else []
+    return {
+        "status": "ok",
+        "stage": args.stage,
+        "nc": list(nc),
+        "flow_grid": flow_grid,
+        "num_candidates": len(results),
+        "results": results,
+        "ranked_results": ranked,
+        "best_result": ranked[0] if ranked else None,
+    }
+
+
 def artifact_path(args: argparse.Namespace) -> Path:
     job_id = os.environ.get("SLURM_JOB_ID", "local")
     return Path(args.artifact_dir) / f"{args.stage}.{job_id}.{args.run_name}.json"
@@ -402,7 +478,7 @@ def write_artifact(path: Path, payload: Dict[str, object]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run one SMB benchmark stage.")
-    parser.add_argument("--stage", choices=["solver-check", "reference-eval", "nc-screen"], required=True)
+    parser.add_argument("--stage", choices=["solver-check", "reference-eval", "nc-screen", "flow-screen"], required=True)
     parser.add_argument("--run-name", default="pace_stage")
     parser.add_argument("--artifact-dir", default=str(REPO_ROOT / "artifacts" / "smb_stage_runs"))
     parser.add_argument("--solver-name", default="auto")
@@ -421,6 +497,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffeed", type=float, default=1.3)
     parser.add_argument("--fraf", type=float)
     parser.add_argument("--tstep", type=float, default=9.4)
+    parser.add_argument("--f1-library", default="2.2")
+    parser.add_argument("--fdes-library", default="1.2")
+    parser.add_argument("--fex-library", default="0.9")
+    parser.add_argument("--ffeed-library", default="1.3")
+    parser.add_argument("--tstep-library", default="9.4")
 
     parser.add_argument("--nfex", type=int, default=10)
     parser.add_argument("--nfet", type=int, default=5)
@@ -450,6 +531,8 @@ def main() -> int:
             payload = evaluate_candidate(args, parse_nc(args.nc))
         elif args.stage == "nc-screen":
             payload = run_nc_screen(args)
+        elif args.stage == "flow-screen":
+            payload = run_flow_screen(args)
         else:
             raise ValueError(f"Unknown stage {args.stage}")
         write_artifact(path, payload)
