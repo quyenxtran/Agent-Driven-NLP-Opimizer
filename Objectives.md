@@ -227,7 +227,7 @@ For this study, `nc` is allowed to vary like a design variable, but only within 
 
 These are not free design variables. They are fixed requirements of the problem statement:
 
-- `0 < Ffeed <= 2.5 mL/min`
+- `0.5 <= Ffeed <= 2.5 mL/min`
 - all pump-relevant flows `<= 2.5 mL/min`
 - total physical columns fixed at `8`
 - `purity_ex_meoh_free >= 0.90`
@@ -304,9 +304,9 @@ Do not treat `Fraf` as an independent design variable if that would violate the 
 - No SMB pump may run above `2.5 mL/min`
 - Keep the total number of physical columns fixed at `8`
 
-Treat feed as a free operating variable subject to the same pump cap:
+Treat feed as a free operating variable subject to the same pump cap and minimum operating limit:
 
-- `0 < Ffeed <= 2.5`
+- `0.5 <= Ffeed <= 2.5`
 
 If `nc` is varied, enforce:
 
@@ -321,12 +321,12 @@ Enforce the `2.5 mL/min` cap on every commanded or derived pump-relevant stream:
 - `Ffeed <= 2.5`
 - `Fraf <= 2.5`
 
-Also enforce positivity and physically consistent flow splits:
+Also enforce the minimum operating flow and physically consistent flow splits:
 
-- `F1 > 0`
-- `Fdes > 0`
-- `Fex > 0`
-- `Fraf > 0`
+- `F1 >= 0.5`
+- `Fdes >= 0.5`
+- `Fex >= 0.5`
+- `Fraf >= 0.5`
 - `F2 = F1 - Fex > 0`
 - `F4 = F1 - Fdes > 0`
 
@@ -355,11 +355,12 @@ Also retain the reference process-quality safeguards unless a documented study p
 
 Use these as the default starting bounds for optimization unless the agent documents a better justified range:
 
-- `tstep in [4.0, 8.0]`
-- `Ffeed in (0.0, 2.5]`
-- `F1 in [1.5, 2.5]`
-- `Fdes in (0.0, 2.5]`
-- `Fex in (0.0, 2.5]`
+- `tstep in [8.0, 12.0]`
+- `Ffeed in [0.5, 2.5]`
+- `F1 in [0.5, 2.5]`
+- `Fdes in [0.5, 2.5]`
+- `Fex in [0.5, 2.5]`
+- `Fraf in [0.5, 2.5]`
 
 ## Required Workflow
 

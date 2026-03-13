@@ -29,7 +29,7 @@ Maximize extract productivity of the organic acids, consistent with the local co
 - `purity_ex_meoh_free >= 0.90`
 - `recovery_ex_GA >= 0.90`
 - `recovery_ex_MA >= 0.90`
-- `0 < Ffeed <= 2.5 mL/min`
+- `0.5 <= Ffeed <= 2.5 mL/min`
 - all pump-relevant flows `<= 2.5 mL/min`
 - physically consistent internal flow splits
 
