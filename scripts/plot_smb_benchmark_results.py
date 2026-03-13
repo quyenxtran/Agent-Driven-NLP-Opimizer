@@ -65,6 +65,30 @@ def get_best_payload(artifact: Dict[str, object]) -> Optional[Dict[str, object]]
         return best
     if artifact.get("stage") in {"reference-eval", "solver-check"}:
         return artifact
+    for key in ("ranked_results", "results", "search_results", "validation_results"):
+        items = artifact.get(key)
+        if isinstance(items, list):
+            candidate_items = [item for item in items if isinstance(item, dict)]
+            if not candidate_items:
+                continue
+            best_item = None
+            best_score = None
+            for item in candidate_items:
+                metrics, validated = get_metrics(item)
+                if metrics is None:
+                    continue
+                feasible = 1 if item.get("feasible") else 0
+                productivity = float(metrics.get("productivity_ex_ga_ma", 0.0))
+                violation = 1e9
+                slacks = item.get("constraint_slacks")
+                if isinstance(slacks, dict) and "normalized_total_violation" in slacks:
+                    violation = float(slacks["normalized_total_violation"])
+                score = (feasible, productivity, -violation)
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_item = item
+            if best_item is not None:
+                return best_item
     return None
 
 
