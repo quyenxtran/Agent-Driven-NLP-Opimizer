@@ -122,6 +122,33 @@ if [[ -d "${HOME:-}/.local/ollama/bin" ]]; then
   export PATH="${HOME}/.local/ollama/bin:${PATH}"
 fi
 
+# Ensure scratch-installed IPOPT is visible in batch jobs (same pattern as stage runner).
+IPOPT_BIN_DIR="${IPOPT_BIN_DIR:-}"
+if [[ -z "${IPOPT_BIN_DIR}" && -n "${DEFAULT_SCRATCH_ROOT}" ]]; then
+  IPOPT_BIN_DIR="${DEFAULT_SCRATCH_ROOT}/opt/ipopt/bin"
+fi
+IPOPT_LIB_DIR="${IPOPT_LIB_DIR:-}"
+if [[ -z "${IPOPT_LIB_DIR}" && -n "${DEFAULT_SCRATCH_ROOT}" ]]; then
+  IPOPT_LIB_DIR="${DEFAULT_SCRATCH_ROOT}/opt/ipopt/lib"
+fi
+OPENBLAS_LIBDIR="${OPENBLAS_LIBDIR:-/usr/local/pace-apps/manual/packages/fenics/2018/linux-rhel9-cascadelake/gcc-9.4.0/openblas-0.3.28-cg7h4gbbmohnlrdesf4ykgipgza67why/lib}"
+
+if [[ -n "${IPOPT_BIN_DIR}" && -d "${IPOPT_BIN_DIR}" ]]; then
+  export PATH="${IPOPT_BIN_DIR}:${PATH}"
+fi
+
+runtime_libs=()
+if [[ -n "${IPOPT_LIB_DIR}" && -d "${IPOPT_LIB_DIR}" ]]; then
+  runtime_libs+=("${IPOPT_LIB_DIR}")
+fi
+if [[ -n "${OPENBLAS_LIBDIR}" && -d "${OPENBLAS_LIBDIR}" ]]; then
+  runtime_libs+=("${OPENBLAS_LIBDIR}")
+fi
+if [[ ${#runtime_libs[@]} -gt 0 ]]; then
+  runtime_libs_joined="$(IFS=:; echo "${runtime_libs[*]}")"
+  export LD_LIBRARY_PATH="${runtime_libs_joined}:${LD_LIBRARY_PATH:-}"
+fi
+
 if [[ -n "${SLURM_MEM_PER_NODE:-}" && "${SLURM_MEM_PER_NODE}" != "0" ]]; then
   SMB_MEMORY_GB_COMPUTED="$(( (SLURM_MEM_PER_NODE + 1023) / 1024 ))"
 else
@@ -432,6 +459,16 @@ start_local_qwen() {
 }
 
 probe_ipopt_resources
+
+if [[ -z "${SMB_VERIFIED_IPOPT_EXECUTABLES}" ]]; then
+  echo "ERROR: IPOPT precheck found no usable executable on PATH." >&2
+  echo "Hint: set IPOPT_BIN_DIR/IPOPT_LIB_DIR (or load your IPOPT module) before submission." >&2
+  echo "Current PATH: ${PATH}" >&2
+  echo "Expected examples:" >&2
+  echo "  export IPOPT_BIN_DIR=\"/storage/scratch1/<group>/<user>/opt/ipopt/bin\"" >&2
+  echo "  export IPOPT_LIB_DIR=\"/storage/scratch1/<group>/<user>/opt/ipopt/lib\"" >&2
+  exit 2
+fi
 
 cd "${REPO_ROOT}"
 
