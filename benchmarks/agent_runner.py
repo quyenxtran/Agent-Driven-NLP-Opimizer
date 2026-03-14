@@ -646,21 +646,27 @@ class OpenAICompatClient:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
-        def build_payload(include_stop: bool) -> Dict[str, object]:
+        def build_payload(include_stop: bool, include_temperature: bool) -> Dict[str, object]:
             payload: Dict[str, object] = {
                 "model": model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "temperature": temperature,
             }
+            if include_temperature:
+                payload["temperature"] = temperature
             if include_stop:
                 payload["stop"] = list(stop_sequences)
             return payload
 
-        # Some providers/models reject stop sequences with 400.
-        payload_variants = [("full", build_payload(True)), ("no_stop", build_payload(False))]
+        # Some providers/models reject stop sequences and/or custom temperature controls.
+        payload_variants = [
+            ("full", build_payload(True, True)),
+            ("no_stop", build_payload(False, True)),
+            ("no_temp", build_payload(True, False)),
+            ("no_stop_no_temp", build_payload(False, False)),
+        ]
         last_error = "unknown_error"
 
         for variant_name, payload in payload_variants:
@@ -690,11 +696,19 @@ class OpenAICompatClient:
                             time.sleep(self.retry_backoff_seconds * attempt)
                         continue
 
-                    # If the provider rejects stop controls, retry once without stop.
+                    # If the provider rejects stop controls, retry with the next payload variant.
                     if (
                         exc.code == 400
                         and variant_name == "full"
                         and ("stop" in response_body.lower() or "unsupported" in response_body.lower())
+                    ):
+                        break
+                    # If the provider rejects custom temperature values, retry without temperature.
+                    if (
+                        exc.code == 400
+                        and variant_name in {"full", "no_stop"}
+                        and "temperature" in response_body.lower()
+                        and ("unsupported" in response_body.lower() or "default" in response_body.lower())
                     ):
                         break
                     return None, last_error
