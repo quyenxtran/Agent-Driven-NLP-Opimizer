@@ -2108,32 +2108,69 @@ def executive_controller_decide(
     b_note: Dict[str, object],
     search_results: List[Dict[str, object]],
     consecutive_rejects: int,
+    debate_round: int = 0,
 ) -> Dict[str, object]:
+    """
+    Enhanced Executive Controller with immediate decision-making and debate round limits.
+    
+    Args:
+        debate_round: Current debate round (0 = initial decision, 1 = first debate, 2 = final round)
+    
+    Returns:
+        Executive decision with immediate action or debate continuation directive
+    """
     decision = str(b_note.get("decision", "")).lower()
+    
+    # Immediate decision after Scientist B judgment
     if decision == "approve":
         return {
             "decision": "not_needed",
             "reason": "Scientist_B approved candidate; executive override not needed.",
             "priority_updates": [],
+            "immediate_action": True,
+            "debate_round": debate_round,
         }
+    
     if not bool(args.executive_controller_enabled):
         return {
             "decision": "disabled",
             "reason": "Executive controller disabled by configuration.",
             "priority_updates": [],
+            "immediate_action": True,
+            "debate_round": debate_round,
         }
+    
+    # Check if we've reached maximum debate rounds
+    if debate_round >= 2:
+        return {
+            "decision": "final_decision",
+            "reason": f"Maximum debate rounds ({debate_round}) reached. Making final executive decision.",
+            "priority_updates": ["Maximum debate rounds exhausted - executive must decide now."],
+            "immediate_action": True,
+            "debate_round": debate_round,
+            "max_debates_reached": True,
+        }
+    
+    # If feasible baseline exists, respect Scientist B's rejection
     if has_any_feasible(search_results):
         return {
             "decision": "respect_reject",
             "reason": "Feasible baseline exists; keep scientist rejection in effect.",
             "priority_updates": [],
+            "immediate_action": True,
+            "debate_round": debate_round,
         }
+    
+    # Check consecutive rejection conditions
     if consecutive_rejects < int(args.executive_trigger_rejects):
         return {
             "decision": "respect_reject",
             "reason": f"Consecutive rejects={consecutive_rejects} below trigger={int(args.executive_trigger_rejects)}.",
             "priority_updates": [],
+            "immediate_action": True,
+            "debate_round": debate_round,
         }
+    
     if consecutive_rejects < int(args.executive_force_after_rejects):
         return {
             "decision": "respect_reject",
@@ -2144,18 +2181,24 @@ def executive_controller_decide(
             "priority_updates": [
                 "Executive warning: next reject may force top-priority diagnostic execution."
             ],
+            "immediate_action": True,
+            "debate_round": debate_round,
         }
-
+    
+    # Executive override conditions met - force execution
     forced_idx, forced_reason = executive_forced_index(tasks, tried, int(args.executive_top_k_lock))
     forced_task = tasks[forced_idx]
     forced_key = (tuple(forced_task["nc"]), str(forced_task["seed_name"]))
+    
     if forced_key in tried:
         return {
             "decision": "respect_reject",
             "reason": "No untried executive-forced task available; respecting rejection.",
             "priority_updates": [],
+            "immediate_action": True,
+            "debate_round": debate_round,
         }
-
+    
     return {
         "decision": "override_execute",
         "reason": (
@@ -2169,6 +2212,9 @@ def executive_controller_decide(
             "Executive override executed to break reject loop and establish feasibility baseline.",
             "Run top-ranked reference candidates before additional NC rotation.",
         ],
+        "immediate_action": True,
+        "debate_round": debate_round,
+        "executive_override_executed": True,
     }
 
 
