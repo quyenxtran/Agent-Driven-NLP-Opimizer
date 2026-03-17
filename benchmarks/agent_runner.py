@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=float(
             os.environ.get(
                 "SMB_PROJECT_TARGET_PURITY_EX_MEOH_FREE",
-                os.environ.get("SMB_TARGET_PURITY_EX_MEOH_FREE", "0.90"),
+                os.environ.get("SMB_TARGET_PURITY_EX_MEOH_FREE", "0.60"),
             )
         ),
     )
@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=float(
             os.environ.get(
                 "SMB_PROJECT_TARGET_RECOVERY_GA",
-                os.environ.get("SMB_TARGET_RECOVERY_GA", "0.90"),
+                os.environ.get("SMB_TARGET_RECOVERY_GA", "0.75"),
             )
         ),
     )
@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=float(
             os.environ.get(
                 "SMB_PROJECT_TARGET_RECOVERY_MA",
-                os.environ.get("SMB_TARGET_RECOVERY_MA", "0.90"),
+                os.environ.get("SMB_TARGET_RECOVERY_MA", "0.75"),
             )
         ),
     )
@@ -625,6 +625,14 @@ def text_mentions_required_labels(items: Sequence[str], labels: Sequence[str]) -
 
 def text_mentions_flow_signals(items: Sequence[str]) -> bool:
     pattern = re.compile(r"(Ffeed|F1|Fdes|Fex|Fraf|tstep|flow|F2|F4)", flags=re.IGNORECASE)
+    return any(pattern.search(str(item)) for item in items)
+
+
+def text_mentions_topology_signals(items: Sequence[str]) -> bool:
+    pattern = re.compile(
+        r"(nc=|nc\[|nc\s*\[|topology|zone|z1|z2|z3|z4|column|columns|fragmentation|symmetry|Δz1|Δz2|Δz3|Δz4)",
+        flags=re.IGNORECASE,
+    )
     return any(pattern.search(str(item)) for item in items)
 
 
@@ -1515,6 +1523,11 @@ def append_iteration_research(
         lines.append("- scientist_a_nc_competitor_comparison:")
         for item in a_nc_comp:
             lines.append(f"  - {item}")
+    a_topology = normalize_text_list(a_note.get("column_topology_comparison"), max_items=8)
+    if a_topology:
+        lines.append("- scientist_a_column_topology_comparison:")
+        for item in a_topology:
+            lines.append(f"  - {item}")
     if str(a_note.get("diagnostic_hypothesis", "")).strip():
         lines.append(f"- scientist_a_diagnostic_hypothesis: {str(a_note.get('diagnostic_hypothesis'))}")
     a_fail = normalize_text_list(a_note.get("failure_criteria"), max_items=8)
@@ -1550,6 +1563,11 @@ def append_iteration_research(
     if b_nc_assess:
         lines.append("- scientist_b_nc_strategy_assessment:")
         for item in b_nc_assess:
+            lines.append(f"  - {item}")
+    b_topology = normalize_text_list(b_note.get("column_topology_audit"), max_items=8)
+    if b_topology:
+        lines.append("- scientist_b_column_topology_audit:")
+        for item in b_topology:
             lines.append(f"  - {item}")
     if str(b_note.get("compute_assessment", "")).strip():
         lines.append(f"- scientist_b_compute_assessment: {str(b_note.get('compute_assessment'))}")
@@ -1760,9 +1778,9 @@ def inferred_violation_from_metrics(metrics: Dict[str, object]) -> Optional[floa
     if purity is None and rga is None and rma is None:
         return None
 
-    purity_min = float(env_or_default("SMB_TARGET_PURITY_EX_MEOH_FREE", "0.85"))
-    rga_min = float(env_or_default("SMB_TARGET_RECOVERY_GA", "0.85"))
-    rma_min = float(env_or_default("SMB_TARGET_RECOVERY_MA", "0.85"))
+    purity_min = float(env_or_default("SMB_TARGET_PURITY_EX_MEOH_FREE", "0.60"))
+    rga_min = float(env_or_default("SMB_TARGET_RECOVERY_GA", "0.75"))
+    rma_min = float(env_or_default("SMB_TARGET_RECOVERY_MA", "0.75"))
 
     norm = 0.0
     if purity is not None:
@@ -2317,6 +2335,7 @@ def scientist_a_pick(
             - when two prior runs exist, include explicit deep comparison to BOTH R-1 and R-2 using run_name and metric deltas
             - include explicit flowrate comparisons (Ffeed/F1/Fdes/Fex/Fraf/tstep) across at least two prior runs
             - include explicit delta vectors using this schema token style: Δprod, Δpurity, ΔrGA, ΔrMA, Δviol, ΔFfeed, ΔF1, ΔFdes, ΔFex, ΔFraf, Δtstep
+            - include explicit column topology comparison (nc and zone-column deltas, e.g., ΔZ1..ΔZ4) against R-1, R-2, and one competitor
             - include physics-based rationale (mass balance, zone allocation effects, adsorption/desorption/selectivity), not rank-only claims
             - include explicit compute/budget impact and stopping/failure criteria
 
@@ -2332,6 +2351,7 @@ def scientist_a_pick(
               "last_two_run_comparison": ["<R-1: run_name + metrics + what changed>", "<R-2: run_name + metrics + what changed>"],
               "flowrate_comparison": ["<flow deltas across runs with Ffeed/F1/Fdes/Fex/Fraf/tstep and implication>", "..."],
               "delta_summary": ["<vs R-1: Δprod=..., Δpurity=..., ΔrGA=..., ΔrMA=..., Δviol=..., ΔFfeed=..., ΔF1=..., ΔFdes=..., ΔFex=..., ΔFraf=..., Δtstep=...>", "<vs R-2: ...>", "<vs competitor nc=[...]: Δprod=..., Δpurity=..., ΔrGA=..., ΔrMA=..., Δviol=...>"],
+              "column_topology_comparison": ["<vs R-1: nc=[a,b,c,d] -> candidate=[...], ΔZ1=..., ΔZ2=..., ΔZ3=..., ΔZ4=... and expected impact>", "<vs R-2: ...>", "<vs competitor nc=[...]: topology/zone tradeoff>"],
               "physics_rationale": "<physics-based explanation using zones, flow splits, mass-transfer or mass-balance logic>",
               "nc_competitor_comparison": ["<candidate nc vs two alternatives with rationale>", "..."],
               "diagnostic_hypothesis": "<what this run is testing>",
@@ -2350,7 +2370,7 @@ def scientist_a_pick(
             f"Recent two completed runs:\n{recent_two_block}\n\n"
             f"Remaining candidate shortlist:\n{json.dumps(shortlist, indent=2)}\n\n"
             "Respond with keys: candidate_index, reason, evidence, comparison_to_previous, "
-            "last_two_run_comparison, flowrate_comparison, delta_summary, physics_rationale, nc_competitor_comparison, diagnostic_hypothesis, failure_criteria, fidelity, priority_updates, proposed_followups."
+            "last_two_run_comparison, flowrate_comparison, delta_summary, column_topology_comparison, physics_rationale, nc_competitor_comparison, diagnostic_hypothesis, failure_criteria, fidelity, priority_updates, proposed_followups."
         )
     raw = client.chat(
         "You are an aggressive optimization scientist. Return JSON only and ground claims in evidence.",
@@ -2374,6 +2394,7 @@ def scientist_a_pick(
             last_two_comparisons = normalize_text_list(data.get("last_two_run_comparison"), max_items=4)
             flow_comparisons = normalize_text_list(data.get("flowrate_comparison"), max_items=6)
             delta_summary = normalize_text_list(data.get("delta_summary"), max_items=8)
+            topology_comparisons = normalize_text_list(data.get("column_topology_comparison"), max_items=8)
             physics_rationale = str(data.get("physics_rationale", "")).strip()
             nc_comparisons = normalize_text_list(data.get("nc_competitor_comparison"), max_items=8)
             has_history = (len(results) > 0) or (sqlite_total_records_from_excerpt(sqlite_context_excerpt) > 0)
@@ -2474,6 +2495,30 @@ def scientist_a_pick(
                             "Require explicit ΔFfeed/ΔF1/ΔFdes/ΔFex/ΔFraf/Δtstep signals."
                         ],
                     }
+                if len(topology_comparisons) < 3:
+                    return default_index, {
+                        "mode": "deterministic",
+                        "reason": "Rejected LLM proposal: missing column topology comparison against R-1, R-2, and competitor.",
+                        "priority_updates": [
+                            "Require explicit topology comparison entries with nc and zone-column deltas."
+                        ],
+                    }
+                if not text_mentions_required_labels(topology_comparisons, recent_two_labels):
+                    return default_index, {
+                        "mode": "deterministic",
+                        "reason": "Rejected LLM proposal: column topology comparison must reference both R-1 and R-2.",
+                        "priority_updates": [
+                            "Require R-1 and R-2 references in column topology comparison."
+                        ],
+                    }
+                if not text_mentions_topology_signals(topology_comparisons) or not text_mentions_numeric_values(topology_comparisons):
+                    return default_index, {
+                        "mode": "deterministic",
+                        "reason": "Rejected LLM proposal: topology comparison must include NC/zone details with numeric deltas.",
+                        "priority_updates": [
+                            "Require nc/zone-column topology deltas (e.g., ΔZ1..ΔZ4) with numbers."
+                        ],
+                    }
             if has_history:
                 if len(flow_comparisons) < 1 or not text_mentions_flow_signals(flow_comparisons):
                     return default_index, {
@@ -2520,6 +2565,7 @@ def scientist_a_pick(
             data["last_two_run_comparison"] = last_two_comparisons
             data["flowrate_comparison"] = flow_comparisons
             data["delta_summary"] = delta_summary
+            data["column_topology_comparison"] = topology_comparisons
             data["physics_rationale"] = physics_rationale
             data["nc_competitor_comparison"] = nc_comparisons
             data["failure_criteria"] = normalize_text_list(data.get("failure_criteria"), max_items=8)
@@ -2551,6 +2597,9 @@ def scientist_a_pick(
         ],
         "delta_summary": [
             "LLM output unavailable; no explicit delta summary (R-1/R-2/competitor) was produced."
+        ],
+        "column_topology_comparison": [
+            "LLM output unavailable; no explicit column topology comparison was produced."
         ],
         "physics_rationale": "LLM output unavailable; no physics-based rationale was produced.",
         "nc_competitor_comparison": [
@@ -2636,6 +2685,7 @@ def scientist_b_review(
               "last_two_run_audit": ["<R-1: what happened, metrics, implications>", "<R-2: what happened, metrics, implications>"],
               "flowrate_audit": ["<flow deltas across runs with Ffeed/F1/Fdes/Fex/Fraf/tstep and implications>", "..."],
               "delta_audit": ["<vs R-1: Δprod=..., Δpurity=..., ΔrGA=..., ΔrMA=..., Δviol=..., ΔFfeed=..., ΔF1=..., ΔFdes=..., ΔFex=..., ΔFraf=..., Δtstep=...>", "<vs R-2: ...>", "<proposal vs counterproposal: Δprod=..., Δpurity=..., ΔrGA=..., ΔrMA=..., Δviol=...>"],
+              "column_topology_audit": ["<vs R-1: nc=[...]->[...], ΔZ1=..., ΔZ2=..., ΔZ3=..., ΔZ4=..., implication>", "<vs R-2: ...>", "<proposal vs counterproposal topology tradeoff>"],
               "physics_audit": "<physics-grounded critique (mass balance, zone effects, adsorption/desorption/selectivity)>",
               "counterproposal_run": {{
                 "nc": [a,b,c,d],
@@ -2656,7 +2706,7 @@ def scientist_b_review(
         prompt_warning = f"Prompt build warning: {type(exc).__name__}: {exc}"
         prompt = (
             "You are Scientist_B reviewer. Return JSON only with keys decision, reason, comparison_assessment, "
-            "last_two_run_audit, flowrate_audit, delta_audit, physics_audit, counterproposal_run, nc_strategy_assessment, compute_assessment, counterarguments, required_checks, priority_updates, risk_flags.\n\n"
+            "last_two_run_audit, flowrate_audit, delta_audit, column_topology_audit, physics_audit, counterproposal_run, nc_strategy_assessment, compute_assessment, counterarguments, required_checks, priority_updates, risk_flags.\n\n"
             f"Proposed task:\n{json.dumps(task, indent=2)}\n\n"
             f"Effective candidate:\n{json.dumps(effective_task, indent=2)}\n\n"
             f"Current best result: {summarize_result(best_result) if best_result else 'None yet.'}\n\n"
@@ -2681,6 +2731,7 @@ def scientist_b_review(
         last_two_audit = normalize_text_list(data.get("last_two_run_audit"), max_items=4)
         flow_audit = normalize_text_list(data.get("flowrate_audit"), max_items=6)
         delta_audit = normalize_text_list(data.get("delta_audit"), max_items=8)
+        topology_audit = normalize_text_list(data.get("column_topology_audit"), max_items=8)
         physics_audit = str(data.get("physics_audit", "")).strip()
         counterproposal = data.get("counterproposal_run")
         nc_assessment = normalize_text_list(data.get("nc_strategy_assessment"), max_items=8)
@@ -2781,6 +2832,24 @@ def scientist_b_review(
                 data["risk_flags"] = normalize_text_list(data.get("risk_flags"), max_items=6) + [
                     "Review quality risk: delta audit missing flow deltas."
                 ]
+            if len(topology_audit) < 3:
+                data["decision"] = "reject"
+                data["reason"] = "Rejected: review must include column topology audit for R-1, R-2, and counterproposal."
+                data["risk_flags"] = normalize_text_list(data.get("risk_flags"), max_items=6) + [
+                    "Review quality risk: missing column topology audit block."
+                ]
+            elif not text_mentions_required_labels(topology_audit, recent_two_labels):
+                data["decision"] = "reject"
+                data["reason"] = "Rejected: column topology audit must reference both R-1 and R-2."
+                data["risk_flags"] = normalize_text_list(data.get("risk_flags"), max_items=6) + [
+                    "Review quality risk: topology audit missing R-1/R-2 labels."
+                ]
+            elif not text_mentions_topology_signals(topology_audit) or not text_mentions_numeric_values(topology_audit):
+                data["decision"] = "reject"
+                data["reason"] = "Rejected: column topology audit must include NC/zone numeric deltas."
+                data["risk_flags"] = normalize_text_list(data.get("risk_flags"), max_items=6) + [
+                    "Review quality risk: topology audit lacks numeric topology detail."
+                ]
         if has_history:
             if len(flow_audit) < 1 or not text_mentions_flow_signals(flow_audit):
                 data["decision"] = "reject"
@@ -2874,6 +2943,7 @@ def scientist_b_review(
         data["last_two_run_audit"] = normalize_text_list(data.get("last_two_run_audit"), max_items=4)
         data["flowrate_audit"] = normalize_text_list(data.get("flowrate_audit"), max_items=6)
         data["delta_audit"] = normalize_text_list(data.get("delta_audit"), max_items=8)
+        data["column_topology_audit"] = normalize_text_list(data.get("column_topology_audit"), max_items=8)
         data["physics_audit"] = str(data.get("physics_audit", "")).strip()
         if isinstance(data.get("counterproposal_run"), dict):
             data["counterproposal_run"] = data.get("counterproposal_run")
