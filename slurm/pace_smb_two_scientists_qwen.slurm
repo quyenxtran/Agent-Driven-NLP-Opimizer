@@ -461,10 +461,10 @@ start_local_qwen() {
     OLLAMA_HOST="${OLLAMA_HOST}" "${ollama_exec}" pull "${OLLAMA_MODEL}"
   fi
 
-  prompt_payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"ping"}],"stream":false}' "${OLLAMA_MODEL}")
+  prompt_payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply with exactly: pong"}],"stream":false,"max_tokens":16,"temperature":0}' "${OLLAMA_MODEL}")
   response_file="$(mktemp)"
   http_code="$(curl -sS \
-    --max-time 1200 \
+    --max-time 180 \
     -o "${response_file}" \
     -w '%{http_code}' \
     -H "Content-Type: application/json" \
