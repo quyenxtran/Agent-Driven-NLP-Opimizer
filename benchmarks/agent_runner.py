@@ -1285,6 +1285,13 @@ class OpenAICompatClient:
         if not text:
             return None
         cleaned = text
+        # Keep chain-of-thought enabled upstream, but strip think blocks before JSON decoding.
+        cleaned = re.sub(
+            r"<\s*think\s*>.*?<\s*/\s*think\s*>",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
         for marker in ("<|endoftext|>", "<|im_start|>", "<|im_end|>"):
             idx = cleaned.find(marker)
             if idx != -1:
