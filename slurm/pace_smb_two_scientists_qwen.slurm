@@ -92,6 +92,9 @@ fi
 LOG_DIR="${LOG_DIR:-$REPO_ROOT/logs}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$REPO_ROOT/artifacts/two_scientist_smb}"
 mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
+echo "[$(date '+%F %T')] BOOT: SMB two-scientists script started on $(hostname)"
+echo "[$(date '+%F %T')] BOOT: REPO_ROOT=${REPO_ROOT}"
+echo "[$(date '+%F %T')] BOOT: LOG_DIR=${LOG_DIR} ARTIFACT_DIR=${ARTIFACT_DIR}"
 
 export PYTHONUNBUFFERED=1
 
@@ -287,6 +290,7 @@ SMB_VERIFIED_IPOPT_BASELINE_FALLBACK_TREE=""
 SMB_VERIFIED_IPOPT_SCREENING_FALLBACK_TREE=""
 SMB_VERIFIED_IPOPT_HARD_PROBLEM_FALLBACK_TREE=""
 SMB_VERIFIED_IPOPT_HIGH_PERFORMANCE_FALLBACK_TREE=""
+SMB_IPOPT_PRECHECK_TIMEOUT_SECONDS="${SMB_IPOPT_PRECHECK_TIMEOUT_SECONDS:-20}"
 
 append_resource_item() {
   local var_name="$1"
@@ -306,10 +310,18 @@ probe_ipopt_resources() {
   local combined_options=""
   local probe_output=""
   local solver_cmd=""
+  local timeout_cmd=""
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_cmd="timeout ${SMB_IPOPT_PRECHECK_TIMEOUT_SECONDS}"
+  fi
 
   if command -v ipopt_sens >/dev/null 2>&1; then
     append_resource_item SMB_VERIFIED_IPOPT_EXECUTABLES "ipopt_sens"
-    probe_output="$(ipopt_sens --print-options 2>/dev/null || true)"
+    if [[ -n "${timeout_cmd}" ]]; then
+      probe_output="$(${timeout_cmd} ipopt_sens --print-options 2>/dev/null || true)"
+    else
+      probe_output="$(ipopt_sens --print-options 2>/dev/null || true)"
+    fi
     if [[ -n "${probe_output}" ]]; then
       combined_options="${combined_options}"$'\n'"${probe_output}"
     fi
@@ -317,7 +329,11 @@ probe_ipopt_resources() {
 
   if command -v ipopt >/dev/null 2>&1; then
     append_resource_item SMB_VERIFIED_IPOPT_EXECUTABLES "ipopt"
-    probe_output="$(ipopt --print-options 2>/dev/null || true)"
+    if [[ -n "${timeout_cmd}" ]]; then
+      probe_output="$(${timeout_cmd} ipopt --print-options 2>/dev/null || true)"
+    else
+      probe_output="$(ipopt --print-options 2>/dev/null || true)"
+    fi
     if [[ -n "${probe_output}" ]]; then
       combined_options="${combined_options}"$'\n'"${probe_output}"
     fi
@@ -504,7 +520,9 @@ start_local_qwen() {
   return 0
 }
 
+echo "[$(date '+%F %T')] START: IPOPT precheck (timeout=${SMB_IPOPT_PRECHECK_TIMEOUT_SECONDS}s)"
 probe_ipopt_resources
+echo "[$(date '+%F %T')] DONE: IPOPT precheck"
 
 if [[ -z "${SMB_VERIFIED_IPOPT_EXECUTABLES}" ]]; then
   echo "ERROR: IPOPT precheck found no usable executable on PATH." >&2

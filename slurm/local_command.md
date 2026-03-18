@@ -3,7 +3,7 @@
 ```bash
 # Local: commit and push
 git add .
-git commit -m "further compact initial context"
+git commit -m "even further compact initial context"
 git push origin main
 
 # On PACE
@@ -78,10 +78,22 @@ SMB_FALLBACK_LLM_ENABLED=0,\
 SMB_LOCAL_LLM_MODEL=qwen35-9b-q4-32k:latest,\
 OLLAMA_MODELS=/storage/scratch1/4/qtran47/.ollama/models,\
 OLLAMA_HOST=127.0.0.1:11555,\
-OLLAMA_LOAD_TIMEOUT=40m,\
-SMB_LLM_TIMEOUT_SECONDS=1800,\
+OLLAMA_LOAD_TIMEOUT=5m,\
 OLLAMA_NUM_PARALLEL=1,\
 OLLAMA_MAX_LOADED_MODELS=1,\
+SMB_LLM_TIMEOUT_SECONDS=600,\
+SMB_LLM_MAX_RETRIES=1,\
+SMB_SKIP_INITIAL_PLAN_LLM=1,\
+SMB_OLLAMA_PULL_IF_MISSING=0,\
+SMB_OLLAMA_PREWARM_ENABLED=1,\
+SMB_OLLAMA_PREWARM_MAX_SECONDS=60,\
+SMB_RESEARCH_TAIL_CHARS=1200,\
+SMB_OBJECTIVES_MAX_CHARS=3000,\
+SMB_LLM_SOUL_MAX_CHARS=1800,\
+SMB_PROBLEM_DEFINITION_MAX_CHARS=1200,\
+SMB_SKILLS_MAX_CHARS=1200,\
+SMB_IPOPT_PRECHECK_TIMEOUT_SECONDS=10,\
+SMB_IPOPT_RESOURCE_MAX_CHARS=900,\
 SMB_NC_LIBRARY=all,\
 SMB_AGENT_MAX_SEARCH_EVALS=120,\
 SMB_MIN_PROBE_REFERENCE_RUNS=35,\
@@ -93,6 +105,7 @@ SMB_PROBE_NCP=1,\
 SMB_AGENT_TEE=1,\
 AGENT_ENTRYPOINT="/storage/scratch1/4/qtran47/AutoResearch-SMB/.venv/bin/python -m benchmarks.agent_runner --single-scientist-mode 0 --tee --run-name two_scientists_all35_${JOBTAG} --research-md /storage/home/hcoda1/4/qtran47/AutoResearch-SMB/artifacts/agent_runs/research_two_${JOBTAG}.md --sqlite-db ${DB} --reset-research-section" \
 slurm/pace_smb_two_scientists_qwen.slurm
+
 
 
 #27B
@@ -192,14 +205,14 @@ slurm/pace_smb_two_scientists_qwen_a100.slurm
 
 ```bash
 # Live output/error
-tail -f ~/AutoResearch-SMB/logs/smb-two-scientists-5052358.out
+tail -f ~/AutoResearch-SMB/logs/smb-two-scientists-5052797.out
 tail -f ~/AutoResearch-SMB/logs/smb-two-scientists-5030528.err
-
+tail -f logs/ollama-smb-5052797.log 
 # CPU monitor
 srun --jobid=5030528 --overlap bash -lc 'while true; do top -b -n 1 | head -n 25; sleep 2; done'
 
 # CPU/GPU monitor
-srun --jobid=5052358 --overlap bash -lc '
+srun --jobid=5052797 --overlap bash -lc '
 while true; do
   clear
   echo "=== $(date) ==="
@@ -214,7 +227,7 @@ done'
 ## Live conversation stream (while job is running)
 Live compact stream (scientist A/B/C only):
 
-JOB=5052358
+JOB=5052797
 FILE=$(find ~/AutoResearch-SMB/artifacts/agent_runs -maxdepth 1 -type f -name "agent-runner.${JOB}*.conversations.jsonl" | sort | tail -1)
 
 if [ -z "$FILE" ]; then
