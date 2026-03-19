@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifact-dir", default=str(REPO_ROOT / "artifacts" / "agent_runs"))
     parser.add_argument("--conversation-log", default=os.environ.get("SMB_CONVERSATION_LOG", ""))
     parser.add_argument("--conversation-stream-log", default=os.environ.get("SMB_CONVERSATION_STREAM_LOG", ""))
+    parser.add_argument("--live-results-log", default=os.environ.get("SMB_LIVE_RESULTS_LOG", ""))
     parser.add_argument(
         "--conversation-log-mode",
         default=os.environ.get("SMB_CONVERSATION_LOG_MODE", "compact"),
@@ -811,6 +812,200 @@ def sqlite_history_context(conn: sqlite3.Connection, max_feasible: int = 5, max_
                 lines.append(f"- nc={nc_label} mean_CE_acid={ce_mean:.6g} mean_CR_acid={cr_mean:.6g} n={int(bucket['n'])}")
 
     return "\n".join(lines)
+
+
+def bottleneck_label(result: Dict[str, object]) -> str:
+    metrics, _ = extract_metrics_with_validity(result)
+    purity = as_float(metrics.get("purity_ex_meoh_free")) or 0.0
+    rga = as_float(metrics.get("recovery_ex_GA")) or 0.0
+    rma = as_float(metrics.get("recovery_ex_MA")) or 0.0
+    status = str(result.get("status", "")).strip().lower()
+    if status in {"solver_error", "error", "other"}:
+        return "solver_error"
+    gaps: List[str] = []
+    if purity < 0.60:
+        gaps.append("purity")
+    if rga < 0.75:
+        gaps.append("recovery_ga")
+    if rma < 0.75:
+        gaps.append("recovery_ma")
+    if gaps:
+        return ",".join(gaps)
+    return "unknown"
+
+
+def compact_result_record(result: Dict[str, object]) -> Dict[str, object]:
+    flow = effective_flow(result) or {}
+    metrics, metrics_validated = extract_metrics_with_validity(result)
+    return {
+        "run_name": str(result.get("run_name", "")),
+        "nc": list(result.get("nc", [])),
+        "seed_name": str(result.get("seed_name", "")),
+        "status": str(result.get("status", "")),
+        "feasible": bool(result.get("feasible", False)),
+        "j_validated": as_float(result.get("J_validated")),
+        "productivity": as_float(metrics.get("productivity_ex_ga_ma")),
+        "purity": as_float(metrics.get("purity_ex_meoh_free")),
+        "recovery_ga": as_float(metrics.get("recovery_ex_GA")),
+        "recovery_ma": as_float(metrics.get("recovery_ex_MA")),
+        "normalized_total_violation": effective_violation(result),
+        "metrics_validated": metrics_validated,
+        "flow": {
+            "Ffeed": as_float(flow.get("Ffeed")),
+            "F1": as_float(flow.get("F1")),
+            "Fdes": as_float(flow.get("Fdes")),
+            "Fex": as_float(flow.get("Fex")),
+            "Fraf": as_float(flow.get("Fraf")),
+            "tstep": as_float(flow.get("tstep")),
+        },
+    }
+
+
+def build_evidence_pack(
+    results: Sequence[Dict[str, object]],
+    recent_limit: int = 5,
+    feasible_limit: int = 3,
+    infeasible_limit: int = 4,
+) -> Dict[str, object]:
+    ordered = [item for item in results if isinstance(item, dict)]
+    recent_runs = [compact_result_record(item) for item in ordered[-recent_limit:]]
+
+    feasible_rows = [
+        item
+        for item in ordered
+        if bool(item.get("feasible")) and as_float(item.get("J_validated")) is not None
+    ]
+    feasible_rows = sorted(
+        feasible_rows,
+        key=lambda item: (
+            as_float(item.get("J_validated")) if as_float(item.get("J_validated")) is not None else float("-inf"),
+            as_float((item.get("metrics") or {}).get("productivity_ex_ga_ma"))
+            if isinstance(item.get("metrics"), dict)
+            else float("-inf"),
+        ),
+        reverse=True,
+    )[:feasible_limit]
+    top_feasible = [compact_result_record(item) for item in feasible_rows]
+
+    infeasible_rows = [item for item in ordered if not bool(item.get("feasible"))]
+    near_infeasible = sorted(
+        infeasible_rows,
+        key=lambda item: effective_violation(item),
+    )[: infeasible_limit // 2 + 1]
+    hard_failures = [
+        item
+        for item in infeasible_rows
+        if str(item.get("status", "")).strip().lower() in {"solver_error", "error", "other", "failed"}
+    ]
+    ranked_hard_failures = sorted(
+        hard_failures,
+        key=lambda item: (effective_violation(item), str(item.get("run_name", ""))),
+    )
+    combined: List[Dict[str, object]] = []
+    seen_runs: set[str] = set()
+    for item in near_infeasible + ranked_hard_failures:
+        run_name = str(item.get("run_name", ""))
+        if run_name in seen_runs:
+            continue
+        seen_runs.add(run_name)
+        record = compact_result_record(item)
+        record["bottleneck"] = bottleneck_label(item)
+        combined.append(record)
+        if len(combined) >= infeasible_limit:
+            break
+
+    run_names = []
+    for bucket in (recent_runs, top_feasible, combined):
+        for item in bucket:
+            run_name = str(item.get("run_name", "")).strip()
+            if run_name:
+                run_names.append(run_name)
+
+    return {
+        "recent_runs": recent_runs,
+        "top_feasible": top_feasible,
+        "top_infeasible": combined,
+        "run_name_catalog": sorted(set(run_names)),
+    }
+
+
+def contains_run_reference(text_items: Sequence[str], run_names: Sequence[str]) -> bool:
+    blob = " ".join(str(item) for item in text_items if item is not None)
+    if not blob:
+        return False
+    return any(str(run_name) in blob for run_name in run_names if run_name)
+
+
+def normalize_evidence_refs(value: object, max_items: int = 8) -> List[str]:
+    refs = normalize_text_list(value, max_items=max_items)
+    return [item.strip() for item in refs if str(item).strip()]
+
+
+def evidence_refs_are_grounded(evidence_refs: Sequence[str], run_names: Sequence[str]) -> bool:
+    refs = [str(item).strip() for item in evidence_refs if str(item).strip()]
+    catalog = [str(item).strip() for item in run_names if str(item).strip()]
+    if not refs or not catalog:
+        return False
+    for ref in refs:
+        if not any((run_name == ref) or (run_name in ref) for run_name in catalog):
+            return False
+    return True
+
+
+def required_keys_missing(data: Optional[Dict[str, object]], required_keys: Sequence[str]) -> List[str]:
+    if not isinstance(data, dict):
+        return list(required_keys)
+    return [key for key in required_keys if key not in data]
+
+
+def request_json_with_single_repair(
+    client: "OpenAICompatClient",
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    conversation_role: str,
+    metadata: Dict[str, object],
+    temperature: float,
+    required_keys: Sequence[str],
+) -> Tuple[Optional[Dict[str, object]], Optional[str], bool, str]:
+    raw = client.chat(
+        system_prompt,
+        user_prompt,
+        conversation_role=conversation_role,
+        metadata=metadata,
+        temperature=temperature,
+    )
+    data = client.extract_json(raw)
+    missing = required_keys_missing(data, required_keys)
+    if isinstance(data, dict) and not missing:
+        return data, raw, False, ""
+
+    repair_reason = "missing required keys" if missing else "invalid JSON response"
+    repair_prompt = textwrap.dedent(
+        f"""
+        Your previous response was invalid for role={conversation_role}.
+        Failure reason: {repair_reason}.
+        Required keys: {list(required_keys)}.
+
+        Return ONLY valid JSON object with all required keys and numeric fields preserved where requested.
+        Do not include markdown or analysis text.
+
+        Previous response:
+        {str(raw or '')[:1400]}
+        """
+    ).strip()
+    repair_raw = client.chat(
+        system_prompt,
+        repair_prompt,
+        conversation_role=f"{conversation_role}_repair",
+        metadata={**metadata, "repair_reason": repair_reason},
+        temperature=0.0,
+    )
+    repair_data = client.extract_json(repair_raw)
+    repair_missing = required_keys_missing(repair_data, required_keys)
+    if isinstance(repair_data, dict) and not repair_missing:
+        return repair_data, repair_raw, True, ""
+    return None, repair_raw, True, repair_reason
 
 
 def sqlite_record_count(conn: sqlite3.Connection) -> int:
@@ -3063,6 +3258,10 @@ def scientist_a_pick(
     if not shortlist:
         return default_index, {"mode": "deterministic", "reason": "No remaining tasks."}
 
+    evidence_pack = build_evidence_pack(results, recent_limit=5, feasible_limit=3, infeasible_limit=4)
+    evidence_run_names = [str(item) for item in evidence_pack.get("run_name_catalog", [])]
+    evidence_compact = compact_prompt_block(json.dumps(evidence_pack, separators=(",", ":")), max_chars=1100, max_lines=30)
+
     best = rank_any_results(results)[0] if results else None
     recent_two_block, recent_two_labels = recent_two_run_review_context(results)
     objectives_compact = compact_prompt_block(objectives_excerpt, max_chars=850, max_lines=26)
@@ -3107,6 +3306,9 @@ def scientist_a_pick(
             Simulation objective/constraint context:
             {constraint_compact}
 
+            Evidence pack (PRIMARY SOURCE; use run_name references from this block):
+            {evidence_compact}
+
             Accumulated heuristics (hypotheses and known failure modes):
             {heuristics_compact}
 
@@ -3146,6 +3348,7 @@ def scientist_a_pick(
             - compare candidate NC against at least two alternative NC layouts from the strategy board
             - compare candidate against previous result evidence (current best + recent failure when available)
             - include quantitative metric evidence in comparisons (at least one of: productivity, purity, recovery, violation, feasible/J)
+            - include explicit run references from evidence pack (run_name tokens) in reason/comparisons/physics rationale
             - when two prior runs exist, include explicit deep comparison to BOTH R-1 and R-2 using run_name and metric deltas
             - include explicit flowrate comparisons (Ffeed/F1/Fdes/Fex/Fraf/tstep) across at least two prior runs
             - include explicit delta vectors using this schema token style: Δprod, Δpurity, ΔrGA, ΔrMA, Δviol, ΔFfeed, ΔF1, ΔFdes, ΔFex, ΔFraf, Δtstep
@@ -3168,6 +3371,7 @@ def scientist_a_pick(
             {{
               "candidate_index": <0-based index into shortlist>,
               "reason": "<brief reason>",
+              "evidence_refs": ["<run_name from evidence pack>", "..."],
               "acquisition_type": "EXPLORE | EXPLOIT | VERIFY",
               "information_target": "<what will this run teach us that we don't already know?>",
               "alternatives_considered": ["<candidate X rejected because...>", "<candidate Y rejected because...>"],
@@ -3201,11 +3405,11 @@ def scientist_a_pick(
             "Respond with keys: candidate_index, reason, evidence, comparison_to_previous, "
             "last_two_run_comparison, flowrate_comparison, delta_summary, column_topology_comparison, physics_rationale, nc_competitor_comparison, diagnostic_hypothesis, failure_criteria, fidelity, priority_updates, proposed_followups."
         )
-    raw = client.chat(
-        "You are an aggressive optimization scientist. Return JSON only and ground claims in evidence.",
-        prompt,
+    data, raw, _repaired, repair_error = request_json_with_single_repair(
+        client,
+        system_prompt="You are an aggressive optimization scientist. Return JSON only and ground claims in evidence.",
+        user_prompt=prompt,
         conversation_role="scientist_a_pick",
-        temperature=0.2,
         metadata={
             "iteration": iteration,
             "search_hours_used": budget_used,
@@ -3213,12 +3417,35 @@ def scientist_a_pick(
             "remaining_count": len(remaining),
             "tried_count": len(tried),
         },
+        temperature=0.2,
+        required_keys=(
+            "candidate_index",
+            "reason",
+            "acquisition_type",
+            "evidence",
+            "comparison_to_previous",
+            "physics_rationale",
+            "evidence_refs",
+        ),
     )
-    data = client.extract_json(raw)
+    if not isinstance(data, dict):
+        return default_index, {
+            "mode": "low_quality_recovery",
+            "reason": f"Scientist_A JSON failed after repair ({repair_error or 'invalid_output'}). Forcing diagnostic recovery.",
+            "low_quality_recovery": True,
+            "acquisition_type": "LOW_QUALITY_RECOVERY",
+            "priority_updates": [
+                "Scientist_A output failed strict JSON/evidence contract; schedule force diagnostic next iteration."
+            ],
+            "prompt_warning": prompt_warning,
+            "raw": raw,
+        }
     if data and isinstance(data.get("candidate_index"), int):
         idx = int(data["candidate_index"])
         if 0 <= idx < len(shortlist):
+            reason_text = str(data.get("reason", "")).strip()
             evidence = normalize_text_list(data.get("evidence"), max_items=8)
+            evidence_refs = normalize_evidence_refs(data.get("evidence_refs"), max_items=8)
             comparisons = normalize_text_list(data.get("comparison_to_previous"), max_items=8)
             last_two_comparisons = normalize_text_list(data.get("last_two_run_comparison"), max_items=4)
             flow_comparisons = normalize_text_list(data.get("flowrate_comparison"), max_items=6)
@@ -3235,6 +3462,26 @@ def scientist_a_pick(
                         "Require at least two concrete evidence items (history/constraints/compute/signals) before proposing experiments."
                     ],
                 }
+            if evidence_run_names:
+                if len(evidence_refs) < 1 or not evidence_refs_are_grounded(evidence_refs, evidence_run_names):
+                    return default_index, {
+                        "mode": "deterministic",
+                        "reason": "Rejected LLM proposal: evidence_refs must contain run_name references from the evidence pack.",
+                        "priority_updates": [
+                            "Require evidence_refs grounded in run_name_catalog (recent/top feasible/top infeasible runs)."
+                        ],
+                    }
+                if not contains_run_reference(
+                    [reason_text] + comparisons + [physics_rationale] + last_two_comparisons,
+                    evidence_run_names,
+                ):
+                    return default_index, {
+                        "mode": "deterministic",
+                        "reason": "Rejected LLM proposal: reason/comparison/physics text lacks run_name grounding.",
+                        "priority_updates": [
+                            "Require explicit run_name references in reason/comparison_to_previous/physics_rationale."
+                        ],
+                    }
             if not comparisons:
                 return default_index, {
                     "mode": "deterministic",
@@ -3418,6 +3665,7 @@ def scientist_a_pick(
                     ],
                 }
             data["evidence"] = evidence
+            data["evidence_refs"] = evidence_refs
             data["comparison_to_previous"] = comparisons
             data["last_two_run_comparison"] = last_two_comparisons
             data["flowrate_comparison"] = flow_comparisons
@@ -3498,6 +3746,9 @@ def scientist_b_review(
     default = deterministic_review(task, best_result)
     prompt_warning = ""
     recent_two_block, recent_two_labels = recent_two_run_review_context(results)
+    evidence_pack = build_evidence_pack(results, recent_limit=5, feasible_limit=3, infeasible_limit=4)
+    evidence_run_names = [str(item) for item in evidence_pack.get("run_name_catalog", [])]
+    evidence_compact = compact_prompt_block(json.dumps(evidence_pack, separators=(",", ":")), max_chars=1100, max_lines=30)
     codebase_compact = compact_prompt_block(codebase_context_excerpt, max_chars=420, max_lines=16)
     compute_compact = compact_prompt_block(compute_context_excerpt, max_chars=260, max_lines=12)
     constraint_compact = compact_prompt_block(constraint_context_excerpt, max_chars=420, max_lines=16)
@@ -3554,10 +3805,14 @@ def scientist_b_review(
             Historical simulation context (queried from SQLite):
             {sqlite_compact}
 
+            Evidence pack (PRIMARY SOURCE; reference run_name tokens from this block):
+            {evidence_compact}
+
             Respond with JSON only:
             {{
               "decision": "approve" or "reject",
               "reason": "<brief reason>",
+              "evidence_refs": ["<run_name from evidence pack>", "..."],
               "comparison_assessment": ["<explicit comparison vs prior run(s) with quantitative metric/termination evidence>", "..."],
               "last_two_run_audit": ["<R-1: what happened, metrics, implications>", "<R-2: what happened, metrics, implications>"],
               "flowrate_audit": ["<flow deltas across runs with Ffeed/F1/Fdes/Fex/Fraf/tstep and implications>", "..."],
@@ -3590,11 +3845,11 @@ def scientist_b_review(
             f"Current best result: {summarize_result(best_result) if best_result else 'None yet.'}\n\n"
             f"Recent two completed runs:\n{recent_two_compact}"
         )
-    raw = client.chat(
-        "You are a hard-nosed numerical reviewer. Return JSON only and challenge weak proposals.",
-        prompt,
+    data, raw, _repaired, repair_error = request_json_with_single_repair(
+        client,
+        system_prompt="You are a hard-nosed numerical reviewer. Return JSON only and challenge weak proposals.",
+        user_prompt=prompt,
         conversation_role="scientist_b_review",
-        temperature=0.1,
         metadata={
             "iteration": iteration,
             "candidate_nc": task.get("nc"),
@@ -3602,9 +3857,35 @@ def scientist_b_review(
             "effective_flow": effective_task.get("flow", {}),
             "has_best_result": best_result is not None,
         },
+        temperature=0.1,
+        required_keys=(
+            "decision",
+            "reason",
+            "comparison_assessment",
+            "physics_audit",
+            "counterproposal_run",
+            "evidence_refs",
+        ),
     )
-    data = client.extract_json(raw)
+    if not isinstance(data, dict):
+        return {
+            "mode": "low_quality_recovery",
+            "decision": "reject",
+            "reason": f"Scientist_B JSON failed after repair ({repair_error or 'invalid_output'}). Forcing diagnostic recovery.",
+            "low_quality_recovery": True,
+            "acquisition_type": "LOW_QUALITY_RECOVERY",
+            "priority_updates": [
+                "Scientist_B output failed strict JSON/evidence contract; force diagnostic path."
+            ],
+            "risk_flags": [
+                "Scientist_B output invalid after one repair retry."
+            ],
+            "prompt_warning": prompt_warning,
+            "raw": raw,
+        }
     if data and str(data.get("decision", "")).lower() in {"approve", "reject"}:
+        reason_text = str(data.get("reason", "")).strip()
+        evidence_refs = normalize_evidence_refs(data.get("evidence_refs"), max_items=8)
         comparisons = normalize_text_list(data.get("comparison_assessment"), max_items=8)
         last_two_audit = normalize_text_list(data.get("last_two_run_audit"), max_items=4)
         flow_audit = normalize_text_list(data.get("flowrate_audit"), max_items=6)
@@ -3614,6 +3895,22 @@ def scientist_b_review(
         counterproposal = data.get("counterproposal_run")
         nc_assessment = normalize_text_list(data.get("nc_strategy_assessment"), max_items=8)
         has_history = best_result is not None or (sqlite_total_records_from_excerpt(sqlite_context_excerpt) > 0)
+        quality_failure = False
+        if evidence_run_names:
+            if len(evidence_refs) < 1 or not evidence_refs_are_grounded(evidence_refs, evidence_run_names):
+                data["decision"] = "reject"
+                data["reason"] = "Rejected: evidence_refs must reference run_name entries from the evidence pack."
+                data["risk_flags"] = normalize_text_list(data.get("risk_flags"), max_items=6) + [
+                    "Review quality risk: evidence_refs are missing or not grounded in evidence rows."
+                ]
+                quality_failure = True
+            if not contains_run_reference([reason_text] + comparisons + [physics_audit], evidence_run_names):
+                data["decision"] = "reject"
+                data["reason"] = "Rejected: review reason/comparison/physics text lacks run_name grounding."
+                data["risk_flags"] = normalize_text_list(data.get("risk_flags"), max_items=6) + [
+                    "Review quality risk: missing run_name references in reason/comparison/physics audit."
+                ]
+                quality_failure = True
         if not review_references_candidate_nc(
             str(data.get("reason", "")),
             comparisons,
@@ -3628,6 +3925,7 @@ def scientist_b_review(
             data["comparison_assessment"] = comparisons or [
                 "Unable to verify candidate-specific comparison; review appears to cite a different NC."
             ]
+            quality_failure = True
         if not comparisons:
             data["decision"] = "reject"
             data["reason"] = "Rejected: review must include explicit comparison to previous results."
@@ -3640,6 +3938,7 @@ def scientist_b_review(
             data["comparison_assessment"] = [
                 "No comparison provided; cannot assess whether proposal improves on prior evidence."
             ]
+            quality_failure = True
         if has_history and not text_mentions_prior_runs(comparisons):
             data["decision"] = "reject"
             data["reason"] = "Rejected: review comparison lacks concrete prior-run references."
@@ -3649,6 +3948,7 @@ def scientist_b_review(
             data["comparison_assessment"] = comparisons or [
                 "No run-level prior evidence referenced."
             ]
+            quality_failure = True
         if has_history and not text_mentions_metric_signals(comparisons):
             data["decision"] = "reject"
             data["reason"] = "Rejected: review comparison is not metric-grounded."
@@ -3658,6 +3958,7 @@ def scientist_b_review(
             data["comparison_assessment"] = comparisons or [
                 "No quantitative metric evidence referenced."
             ]
+            quality_failure = True
         if len(recent_two_labels) >= 2:
             if len(last_two_audit) < 2:
                 data["decision"] = "reject"
@@ -3818,6 +4119,7 @@ def scientist_b_review(
                     "Re-run review with explicit checks tied to bounds, solver behavior, and feasibility."
                 ]
         data["comparison_assessment"] = normalize_text_list(data.get("comparison_assessment"), max_items=8)
+        data["evidence_refs"] = evidence_refs
         data["last_two_run_audit"] = normalize_text_list(data.get("last_two_run_audit"), max_items=4)
         data["flowrate_audit"] = normalize_text_list(data.get("flowrate_audit"), max_items=6)
         data["delta_audit"] = normalize_text_list(data.get("delta_audit"), max_items=8)
@@ -3827,6 +4129,13 @@ def scientist_b_review(
             data["counterproposal_run"] = data.get("counterproposal_run")
         data["nc_strategy_assessment"] = normalize_text_list(data.get("nc_strategy_assessment"), max_items=8)
         data["compute_assessment"] = str(data.get("compute_assessment", "")).strip()
+        reason_final = str(data.get("reason", "")).strip().lower()
+        if not quality_failure and str(data.get("decision", "")).lower() == "reject":
+            if reason_final.startswith("rejected:"):
+                quality_failure = True
+        data["low_quality_recovery"] = bool(quality_failure)
+        if quality_failure:
+            data["acquisition_type"] = "LOW_QUALITY_RECOVERY"
         return {
             "mode": "llm",
             "llm_backend": client.last_backend,
@@ -3834,7 +4143,20 @@ def scientist_b_review(
             "raw": raw,
             **data,
         }
-    return {"mode": "deterministic", **default}
+    return {
+        "mode": "low_quality_recovery",
+        "decision": "reject",
+        "reason": "Scientist_B produced an invalid decision payload after repair; forcing diagnostic recovery.",
+        "low_quality_recovery": True,
+        "acquisition_type": "LOW_QUALITY_RECOVERY",
+        "priority_updates": [
+            "Scientist_B output invalid after retry; schedule deterministic diagnostic task."
+        ],
+        "risk_flags": [
+            "Scientist_B review output was not parseable as approve/reject decision."
+        ],
+        "fallback_review": default,
+    }
 
 
 def scientist_c_arbitrate(
@@ -3862,11 +4184,15 @@ def scientist_c_arbitrate(
     recent_two_compact = compact_prompt_block(recent_two_block, max_chars=420, max_lines=16)
     heuristics_compact = compact_prompt_block(heuristics_context, max_chars=520, max_lines=18)
     sqlite_compact = compact_prompt_block(sqlite_context_excerpt, max_chars=520, max_lines=18)
+    evidence_pack = build_evidence_pack(results, recent_limit=5, feasible_limit=3, infeasible_limit=4)
+    evidence_run_names = [str(item) for item in evidence_pack.get("run_name_catalog", [])]
+    evidence_compact = compact_prompt_block(json.dumps(evidence_pack, separators=(",", ":")), max_chars=1100, max_lines=30)
     priorities_compact = "\n".join(f"- {p}" for p in current_priorities[:6]) or "- none"
     a_brief = {
         "decision": str(a_note.get("decision", "")).strip(),
         "reason": str(a_note.get("reason", "")).strip(),
         "acquisition_type": str(a_note.get("acquisition_type", "")).strip(),
+        "evidence_refs": normalize_evidence_refs(a_note.get("evidence_refs"), max_items=6),
         "candidate_index": a_note.get("candidate_index"),
         "candidate": {"nc": list(task.get("nc", [])), "seed_name": str(task.get("seed_name", ""))},
         "evidence": normalize_text_list(a_note.get("evidence"), max_items=4),
@@ -3878,6 +4204,7 @@ def scientist_c_arbitrate(
     b_brief = {
         "decision": str(b_note.get("decision", "")).strip(),
         "reason": str(b_note.get("reason", "")).strip(),
+        "evidence_refs": normalize_evidence_refs(b_note.get("evidence_refs"), max_items=6),
         "comparison_assessment": normalize_text_list(b_note.get("comparison_assessment"), max_items=4),
         "counterproposal_run": b_note.get("counterproposal_run"),
         "nc_strategy_assessment": normalize_text_list(b_note.get("nc_strategy_assessment"), max_items=4),
@@ -3943,6 +4270,9 @@ def scientist_c_arbitrate(
             SQLite context:
             {sqlite_compact}
 
+            Evidence bundle (PRIMARY SOURCE; cite run_name references from this block):
+            {evidence_compact}
+
             If you choose RETURN_FOR_REVISION, keep the request bounded and actionable.
             If revision pressure is already high, switch to FORCE_DIAGNOSTIC.
             If a diagnostic is needed, prefer a task that tests the suspected failure mode directly.
@@ -3955,16 +4285,17 @@ def scientist_c_arbitrate(
               "diagnostic_focus": "<what to test if forcing diagnostic>",
               "revision_request": "<what revision should address>",
               "selected_task_mode": "<A | B_COUNTER | HYBRID | DIAGNOSTIC>",
-              "acquisition_type": "<compact label for logging>"
+              "acquisition_type": "<compact label for logging>",
+              "evidence_refs": ["<run_name from evidence bundle>", "..."]
             }}
             """
         ).strip()
         prompt = compact_prompt_block(prompt, max_chars=2600, max_lines=90)
-        raw = exec_client.chat(
-            "You are a decisive process executive. Return JSON only.",
-            prompt,
+        data, raw, _repaired, _repair_error = request_json_with_single_repair(
+            exec_client,
+            system_prompt="You are a decisive process executive. Return JSON only.",
+            user_prompt=prompt,
             conversation_role="scientist_c_arbitrate",
-            temperature=0.1,
             metadata={
                 "iteration": iteration,
                 "candidate_nc": task.get("nc"),
@@ -3973,12 +4304,19 @@ def scientist_c_arbitrate(
                 "force_diagnostic_reason": force_diagnostic_reason,
                 "executive_model": exec_model,
             },
+            temperature=0.1,
+            required_keys=(
+                "decision",
+                "reason",
+                "selected_task_mode",
+                "acquisition_type",
+                "evidence_refs",
+            ),
         )
         if exec_client is not client:
             client.conversations.extend(exec_client.conversations)
             if exec_client.last_backend != "none":
                 client.last_backend = exec_client.last_backend
-        data = client.extract_json(raw)
         if isinstance(data, dict):
             decision = str(data.get("decision", "")).strip().upper()
             valid = {
@@ -3989,6 +4327,14 @@ def scientist_c_arbitrate(
                 "FORCE_DIAGNOSTIC",
             }
             if decision in valid:
+                evidence_refs = normalize_evidence_refs(data.get("evidence_refs"), max_items=8)
+                if evidence_run_names and not evidence_refs_are_grounded(evidence_refs, evidence_run_names):
+                    data["decision"] = "FORCE_DIAGNOSTIC"
+                    data["reason"] = "Executive output missing grounded evidence_refs; forcing diagnostic path."
+                    data["selected_task_mode"] = "DIAGNOSTIC"
+                    data["acquisition_type"] = "FORCE_DIAGNOSTIC"
+                    evidence_refs = evidence_run_names[:2]
+                decision = str(data.get("decision", decision)).strip().upper()
                 data["decision"] = decision
                 data["reason"] = str(data.get("reason", "")).strip()
                 data["priority_updates"] = normalize_text_list(data.get("priority_updates"), max_items=8)
@@ -3996,6 +4342,7 @@ def scientist_c_arbitrate(
                 data["revision_request"] = str(data.get("revision_request", "")).strip()
                 data["selected_task_mode"] = str(data.get("selected_task_mode", "")).strip().upper()
                 data["acquisition_type"] = str(data.get("acquisition_type", "")).strip().upper()
+                data["evidence_refs"] = evidence_refs
                 data["llm_backend"] = exec_client.last_backend
                 data["raw"] = raw
                 data["mode"] = "llm"
@@ -4291,9 +4638,30 @@ def conversation_stream_log_path(args: argparse.Namespace, conversation_path: Pa
     return Path(str(conversation_path) + ".jsonl")
 
 
+def live_results_log_path(args: argparse.Namespace, artifact_path_value: Path) -> Path:
+    if args.live_results_log:
+        return Path(args.live_results_log)
+    if artifact_path_value.suffix:
+        return artifact_path_value.with_suffix(".live_results.jsonl")
+    return Path(str(artifact_path_value) + ".live_results.jsonl")
+
+
 def initialize_conversation_stream(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("", encoding="utf-8")
+
+
+def initialize_live_results_stream(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+
+
+def append_live_results_event(path: Path, record: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(record)
+    payload.setdefault("timestamp_utc", utc_now_text())
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
 def write_artifact(path: Path, payload: Dict[str, object]) -> None:
@@ -4317,6 +4685,7 @@ def main() -> int:
     artifact = artifact_path(args)
     conversation_artifact = conversation_log_path(args)
     conversation_stream_artifact = conversation_stream_log_path(args, conversation_artifact)
+    live_results_artifact = live_results_log_path(args, artifact)
     research_path = Path(args.research_md)
     objectives_excerpt = markdown_focused_excerpt(
         args.objectives_file,
@@ -4418,9 +4787,64 @@ def main() -> int:
     force_diagnostic_reason = ""
     revision_iterations: List[int] = []
 
+    def emit_live_event(
+        event: str,
+        *,
+        iteration: Optional[int] = None,
+        role: str = "",
+        decision: str = "",
+        reason: str = "",
+        task: Optional[Dict[str, object]] = None,
+        result: Optional[Dict[str, object]] = None,
+        note: Optional[Dict[str, object]] = None,
+        acquisition_type: str = "",
+        arbitration_outcome: str = "",
+    ) -> None:
+        selected_task: Dict[str, object] = {}
+        if isinstance(task, dict):
+            selected_task = {
+                "nc": list(task.get("nc", [])) if isinstance(task.get("nc"), list) else [],
+                "seed_name": str(task.get("seed_name", "")),
+            }
+            if isinstance(task.get("flow_override"), dict):
+                selected_task["flow_override"] = task.get("flow_override")
+        record: Dict[str, object] = {
+            "event": event,
+            "job_id": os.environ.get("SLURM_JOB_ID", "local"),
+            "run_name": args.run_name,
+            "iteration": int(iteration) if isinstance(iteration, int) else None,
+            "role": role,
+            "decision": decision or (str(note.get("decision", "")) if isinstance(note, dict) else ""),
+            "reason": reason or (str(note.get("reason", "")) if isinstance(note, dict) else ""),
+            "selected_task": selected_task,
+            "acquisition_type": acquisition_type or (str(note.get("acquisition_type", "")) if isinstance(note, dict) else ""),
+            "arbitration_outcome": arbitration_outcome,
+        }
+        if isinstance(result, dict):
+            metrics, _ = extract_metrics_with_validity(result)
+            record.update(
+                {
+                    "result_run_name": str(result.get("run_name", "")),
+                    "solver_status": str(result.get("status", "")),
+                    "feasible": bool(result.get("feasible", False)),
+                    "j_validated": as_float(result.get("J_validated")),
+                    "productivity": as_float(metrics.get("productivity_ex_ga_ma")),
+                    "purity": as_float(metrics.get("purity_ex_meoh_free")),
+                    "recovery_ga": as_float(metrics.get("recovery_ex_GA")),
+                    "recovery_ma": as_float(metrics.get("recovery_ex_MA")),
+                    "normalized_total_violation": effective_violation(result),
+                }
+            )
+        if isinstance(note, dict):
+            evidence_refs = normalize_evidence_refs(note.get("evidence_refs"), max_items=6)
+            if evidence_refs:
+                record["evidence_refs"] = evidence_refs
+        append_live_results_event(live_results_artifact, record)
+
     try:
         progress_log("AGENT: init start")
         initialize_conversation_stream(conversation_stream_artifact)
+        initialize_live_results_stream(live_results_artifact)
         if args.reset_research_section:
             reset_research_run_section(research_path, args.run_name)
         nc_library_values = [list(nc) for nc in rs.parse_nc_library(args.nc_library)]
@@ -4479,6 +4903,13 @@ def main() -> int:
                 "AGENT: iteration "
                 + str(search_iteration)
                 + f" start (tried={len(tried)}/{len(search_tasks)}, search_hours={search_hours_used:.3f})"
+            )
+            emit_live_event(
+                "iteration_start",
+                iteration=search_iteration,
+                role="main_loop",
+                decision="ITERATION_START",
+                reason=f"tried={len(tried)}/{len(search_tasks)} search_hours_used={search_hours_used:.4f}",
             )
             sqlite_excerpt = sqlite_history_context(sqlite_conn)
             nc_strategy_excerpt = nc_strategy_board(sqlite_conn, nc_library_values)
@@ -4543,6 +4974,9 @@ def main() -> int:
                     "diagnostic_focus": diag_note.get("reason", force_diagnostic_reason or ""),
                 }
                 executive_log.append({"task": task, "decision": executive_note})
+                emit_live_event("scientist_a_decision", iteration=search_iteration, role="scientist_a_pick", task=task, note=a_note)
+                emit_live_event("scientist_b_decision", iteration=search_iteration, role="scientist_b_review", task=task, note=b_note)
+                emit_live_event("executive_decision", iteration=search_iteration, role="scientist_c_arbitrate", task=task, note=executive_note, arbitration_outcome="FORCE_DIAGNOSTIC")
                 current_priorities = merge_priority_board(current_priorities, a_note, b_note, executive_note)
                 append_iteration_research(
                     research_path,
@@ -4581,6 +5015,15 @@ def main() -> int:
                 )
                 result["diagnostic_forced"] = True
                 result["diagnostic_forced_reason"] = force_diagnostic_reason
+                emit_live_event(
+                    "simulation_complete",
+                    iteration=search_iteration,
+                    role="simulation",
+                    task=task,
+                    result=result,
+                    acquisition_type="FORCE_DIAGNOSTIC",
+                    arbitration_outcome="FORCE_DIAGNOSTIC",
+                )
                 search_results.append(result)
                 persist_result_to_sqlite(sqlite_conn, args.run_name, "search", result)
                 sim_counter += 1
@@ -4675,6 +5118,9 @@ def main() -> int:
                     }
                 )
                 executive_log.append({"task": task, "decision": executive_note})
+                emit_live_event("scientist_a_decision", iteration=search_iteration, role="scientist_a_pick", task=task, note=a_note)
+                emit_live_event("scientist_b_decision", iteration=search_iteration, role="scientist_b_review", task=task, note=b_note)
+                emit_live_event("executive_decision", iteration=search_iteration, role="executive_controller", task=task, note=executive_note, arbitration_outcome="RANDOM_SEARCH")
                 current_priorities = merge_priority_board(current_priorities, a_note, b_note, executive_note)
                 append_iteration_research(
                     research_path,
@@ -4712,6 +5158,15 @@ def main() -> int:
                     + f"wall_s={float(((result.get('timing') or {}).get('wall_seconds') or 0.0)):.1f}"
                 )
                 result["random_search_mode"] = True
+                emit_live_event(
+                    "simulation_complete",
+                    iteration=search_iteration,
+                    role="simulation",
+                    task=task,
+                    result=result,
+                    acquisition_type="RANDOM_SEARCH",
+                    arbitration_outcome="RANDOM_SEARCH",
+                )
                 search_results.append(result)
                 persist_result_to_sqlite(sqlite_conn, args.run_name, "search", result)
                 sim_counter += 1
@@ -4830,6 +5285,29 @@ def main() -> int:
                     "decision": a_note,
                 }
             )
+            emit_live_event("scientist_a_decision", iteration=search_iteration, role="scientist_a_pick", task=task, note=a_note)
+            a_reason_text = str(a_note.get("reason", "")).strip()
+            a_low_quality = bool(a_note.get("low_quality_recovery"))
+            if (not a_low_quality) and str(a_note.get("mode", "")).strip().lower() == "deterministic":
+                if a_reason_text.lower().startswith("rejected llm proposal"):
+                    a_low_quality = True
+            if a_low_quality:
+                force_diagnostic_next_iteration = True
+                force_diagnostic_reason = a_reason_text or "Scientist_A output failed quality gate."
+                emit_live_event(
+                    "quality_recovery",
+                    iteration=search_iteration,
+                    role="scientist_a_pick",
+                    task=task,
+                    note=a_note,
+                    acquisition_type="LOW_QUALITY_RECOVERY",
+                    arbitration_outcome="FORCE_DIAGNOSTIC",
+                )
+                append_research(
+                    research_path,
+                    f"- low_quality_recovery: scientist_a iteration={search_iteration} reason={force_diagnostic_reason}\n",
+                )
+                continue
             best_so_far = rank_any_results(search_results)[0] if search_results else None
             if bool(int(getattr(args, "single_scientist_mode", 0))):
                 b_note = single_scientist_policy_review(task, best_so_far)
@@ -4868,6 +5346,29 @@ def main() -> int:
                     "decision": b_note,
                 }
             )
+            emit_live_event("scientist_b_decision", iteration=search_iteration, role="scientist_b_review", task=task, note=b_note)
+            b_reason_text = str(b_note.get("reason", "")).strip()
+            b_low_quality = bool(b_note.get("low_quality_recovery"))
+            if (not b_low_quality) and str(b_note.get("mode", "")).strip().lower() == "llm":
+                if b_reason_text.lower().startswith("rejected:"):
+                    b_low_quality = True
+            if b_low_quality:
+                force_diagnostic_next_iteration = True
+                force_diagnostic_reason = b_reason_text or "Scientist_B output failed quality gate."
+                emit_live_event(
+                    "quality_recovery",
+                    iteration=search_iteration,
+                    role="scientist_b_review",
+                    task=task,
+                    note=b_note,
+                    acquisition_type="LOW_QUALITY_RECOVERY",
+                    arbitration_outcome="FORCE_DIAGNOSTIC",
+                )
+                append_research(
+                    research_path,
+                    f"- low_quality_recovery: scientist_b iteration={search_iteration} reason={force_diagnostic_reason}\n",
+                )
+                continue
             b_approved = str(b_note.get("decision", "approve")).lower() == "approve"
             if b_approved:
                 consecutive_rejects = 0
@@ -4925,6 +5426,14 @@ def main() -> int:
                     c_note["priority_updates"] = normalize_text_list(c_note.get("priority_updates"), max_items=8)
                     c_note["priority_updates"].append("Revision returned without execution; count as a wasted reject.")
                     executive_log.append({"task": task, "decision": c_note})
+                    emit_live_event(
+                        "executive_decision",
+                        iteration=search_iteration,
+                        role="scientist_c_arbitrate",
+                        task=task,
+                        note=c_note,
+                        arbitration_outcome="RETURN_FOR_REVISION",
+                    )
                     current_priorities = merge_priority_board(current_priorities, a_note, b_note, c_note)
                     append_iteration_research(
                         research_path,
@@ -4963,6 +5472,14 @@ def main() -> int:
                         c_note["acquisition_type"] = "WASTED_REJECT"
                         c_note["decision"] = "RETURN_FOR_REVISION"
                         executive_log.append({"task": task, "decision": c_note})
+                        emit_live_event(
+                            "executive_decision",
+                            iteration=search_iteration,
+                            role="scientist_c_arbitrate",
+                            task=task,
+                            note=c_note,
+                            arbitration_outcome="RETURN_FOR_REVISION",
+                        )
                         current_priorities = merge_priority_board(current_priorities, a_note, b_note, c_note)
                         append_iteration_research(
                             research_path,
@@ -5047,6 +5564,14 @@ def main() -> int:
 
                 executive_note = c_note
                 executive_log.append({"task": task, "decision": executive_note})
+                emit_live_event(
+                    "executive_decision",
+                    iteration=search_iteration,
+                    role="scientist_c_arbitrate",
+                    task=selected_task,
+                    note=executive_note,
+                    arbitration_outcome=str(executive_note.get("decision", "")).strip().upper(),
+                )
                 current_priorities = merge_priority_board(current_priorities, a_note, b_note, executive_note)
                 append_iteration_research(
                     research_path,
@@ -5087,6 +5612,15 @@ def main() -> int:
                 )
                 result["arbitration_decision"] = executive_note.get("decision")
                 result["arbitration_note"] = executive_note
+                emit_live_event(
+                    "simulation_complete",
+                    iteration=search_iteration,
+                    role="simulation",
+                    task=selected_task,
+                    result=result,
+                    acquisition_type=str(executive_note.get("acquisition_type", "")).strip().upper(),
+                    arbitration_outcome=str(executive_note.get("decision", "")).strip().upper(),
+                )
                 search_results.append(result)
                 persist_result_to_sqlite(sqlite_conn, args.run_name, "search", result)
                 sim_counter += 1
@@ -5143,6 +5677,14 @@ def main() -> int:
                 consecutive_rejects,
             )
             executive_log.append({"task": task, "decision": executive_note})
+            emit_live_event(
+                "executive_decision",
+                iteration=search_iteration,
+                role="executive_controller",
+                task=task,
+                note=executive_note,
+                arbitration_outcome=str(executive_note.get("decision", "")).strip().upper(),
+            )
             current_priorities = merge_priority_board(current_priorities, a_note, b_note, executive_note)
             append_iteration_research(
                 research_path,
@@ -5159,6 +5701,15 @@ def main() -> int:
             if not b_approved:
                 if str(executive_note.get("decision", "")).lower() != "override_execute":
                     tried.add(task_key)
+                    emit_live_event(
+                        "wasted_reject",
+                        iteration=search_iteration,
+                        role="scientist_b_review",
+                        task=task,
+                        note=b_note,
+                        acquisition_type="WASTED_REJECT",
+                        arbitration_outcome="RESPECT_REJECT",
+                    )
                     append_research(
                         research_path,
                         f"- search_result_run: skipped_by_scientist_b at {utc_now_text()} for task={task}\n",
@@ -5205,6 +5756,15 @@ def main() -> int:
                 )
                 result["executive_forced"] = True
                 result["executive_forced_from_task"] = task
+                emit_live_event(
+                    "simulation_complete",
+                    iteration=search_iteration,
+                    role="simulation",
+                    task=forced_task,
+                    result=result,
+                    acquisition_type="FORCE_DIAGNOSTIC",
+                    arbitration_outcome="OVERRIDE_EXECUTE",
+                )
                 search_results.append(result)
                 persist_result_to_sqlite(sqlite_conn, args.run_name, "search", result)
                 sim_counter += 1
@@ -5263,6 +5823,15 @@ def main() -> int:
                 "AGENT: execute search done "
                 + f"run={result.get('run_name')} status={result.get('status')} "
                 + f"wall_s={float(((result.get('timing') or {}).get('wall_seconds') or 0.0)):.1f}"
+            )
+            emit_live_event(
+                "simulation_complete",
+                iteration=search_iteration,
+                role="simulation",
+                task=task,
+                result=result,
+                acquisition_type=str(a_note.get("acquisition_type", "")).strip().upper(),
+                arbitration_outcome="DIRECT_EXECUTION",
             )
             search_results.append(result)
             persist_result_to_sqlite(sqlite_conn, args.run_name, "search", result)
@@ -5323,6 +5892,15 @@ def main() -> int:
                 + f"wall_s={float(((validation.get('timing') or {}).get('wall_seconds') or 0.0)):.1f}"
             )
             validation_results.append(validation)
+            emit_live_event(
+                "simulation_complete",
+                iteration=search_iteration,
+                role="validation",
+                task={"nc": list(candidate.get("nc", [])), "seed_name": str(candidate.get("seed_name", ""))},
+                result=validation,
+                acquisition_type="VALIDATION",
+                arbitration_outcome="VALIDATION",
+            )
             persist_result_to_sqlite(sqlite_conn, args.run_name, "validation", validation)
             append_result_research(research_path, validation, "validation")
             append_research(
@@ -5412,6 +5990,9 @@ def main() -> int:
                 "path": str(conversation_artifact.resolve()),
                 "stream_path": str(conversation_stream_artifact.resolve()),
                 "count": len(client.conversations),
+            },
+            "live_results": {
+                "path": str(live_results_artifact.resolve()),
             },
             "benchmark_budget": {
                 "total_hours": args.benchmark_hours,
@@ -5509,6 +6090,9 @@ def main() -> int:
                 "path": str(conversation_artifact.resolve()),
                 "stream_path": str(conversation_stream_artifact.resolve()),
                 "count": len(client.conversations),
+            },
+            "live_results": {
+                "path": str(live_results_artifact.resolve()),
             },
         }
         write_artifact(artifact, payload)

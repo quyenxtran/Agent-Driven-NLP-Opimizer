@@ -3,9 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import types
 from pathlib import Path
-
-import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -14,20 +13,50 @@ IMPORT_ROOT = PROJECT_ROOT if PROJECT_ROOT.exists() else REPO_ROOT
 if str(IMPORT_ROOT) not in sys.path:
     sys.path.insert(0, str(IMPORT_ROOT))
 
+# Keep unit tests independent from optional solver deps.
+if "pyomo.environ" not in sys.modules:
+    pyomo_mod = types.ModuleType("pyomo")
+    pyomo_env_mod = types.ModuleType("pyomo.environ")
+    pyomo_env_mod.value = lambda x: x
+    pyomo_mod.environ = pyomo_env_mod
+    sys.modules["pyomo"] = pyomo_mod
+    sys.modules["pyomo.environ"] = pyomo_env_mod
+
 from benchmarks import agent_runner as ar
 
 
-class StubClient:
-    def __init__(self, payload: dict[str, object], raw: str = "{}") -> None:
-        self.payload = payload
-        self.raw = raw
+class QueueClient:
+    def __init__(self, responses: list[str], model: str = "stub-model") -> None:
+        self.responses = list(responses)
         self.last_backend = "stub"
+        self.conversations: list[dict[str, object]] = []
+        self.model = model
+        self.base_url = "http://stub.local/v1"
+        self.enabled = True
+        self.api_key = "stub"
+        self.fallback_enabled = False
+        self.fallback_base_url = ""
+        self.fallback_model = ""
+        self.fallback_api_key = ""
+        self.conversation_stream_path = None
+        self.timeout_seconds = 30.0
+        self.max_tokens = 256
+        self.max_retries = 1
+        self.retry_backoff_seconds = 0.0
+        self.conversation_log_mode = "compact"
+        self.conversation_response_max_chars = 1200
 
     def chat(self, *args: object, **kwargs: object) -> str:
-        return self.raw
+        if self.responses:
+            return self.responses.pop(0)
+        return "{}"
 
     def extract_json(self, raw: str) -> dict[str, object]:
-        return self.payload
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
 
 
 def make_args(**overrides: object) -> argparse.Namespace:
@@ -47,201 +76,148 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "executive_force_after_rejects": 3,
         "executive_top_k_lock": 1,
         "single_scientist_mode": 0,
+        "executive_arbitration_enabled": 1,
+        "executive_max_revisions": 1,
+        "executive_llm_model": "stub-model",
+        "systematic_infeasibility_k": 5,
+        "random_search_mode": 0,
+        "method": "agent_v2",
         "nc_library": "1,2,3,2;2,2,2,2",
         "seed_library": "notebook",
+        "f1_bounds": "0.5,5.0",
+        "ffeed_bounds": "0.5,2.5",
+        "fdes_bounds": "0.5,2.5",
+        "fex_bounds": "0.5,2.5",
+        "fraf_bounds": "0.5,2.5",
+        "tstep_bounds": "8.0,12.0",
+        "max_pump_flow": 2.5,
+        "f1_max_flow": 5.0,
+        "purity_min": 0.6,
+        "recovery_ga_min": 0.75,
+        "recovery_ma_min": 0.75,
+        "project_purity_min": 0.6,
+        "project_recovery_ga_min": 0.75,
+        "project_recovery_ma_min": 0.75,
+        "meoh_max_raff_wt": 1.0,
+        "water_max_ex_wt": 1.0,
+        "water_max_zone1_entry_wt": 1.0,
     }
     base.update(overrides)
     return argparse.Namespace(**base)
 
 
-def write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def balanced_counterproposal() -> dict[str, object]:
+def sample_result(
+    run_name: str,
+    *,
+    feasible: bool,
+    status: str,
+    j: float | None,
+    productivity: float,
+    purity: float,
+    rga: float,
+    rma: float,
+    violation: float,
+    nc: list[int] | None = None,
+) -> dict[str, object]:
     return {
-        "nc": [2, 2, 2, 2],
-        "flow_adjustments": {
-            "Ffeed": 0.10,
-            "F1": 0.08,
-            "Fdes": 0.06,
-            "Fex": 0.02,
-            "Fraf": -0.02,
-            "tstep": 0.0,
-        },
-        "expected_metric_effect": {
-            "delta_productivity": 0.05,
-            "delta_purity": 0.01,
-            "delta_recovery_ga": 0.02,
-            "delta_recovery_ma": 0.01,
-            "delta_violation": -0.02,
-        },
-        "physics_justification": "Mass balance and flow split remain consistent.",
-    }
-
-
-def assert_balanced_flow(flow: dict[str, object]) -> None:
-    required = {"Ffeed", "F1", "Fdes", "Fex", "Fraf", "tstep"}
-    assert set(flow) == required
-    assert flow["F1"] == pytest.approx(float(flow["Ffeed"]) + float(flow["Fraf"]))
-    assert flow["F1"] == pytest.approx(float(flow["Fdes"]) + float(flow["Fex"]))
-
-
-def make_heuristics_repo(root: Path) -> None:
-    write_json(
-        root / "agents" / "hypotheses.json",
-        {
-            "_schema_version": "1.0",
-            "hypotheses": [
-                {
-                    "id": "H1",
-                    "title": "Fdes Purity Impact is Non-Linear",
-                    "status": "active_testing",
-                    "confidence": "low_medium",
-                    "statement": "Increasing Fdes has diminishing returns and can amplify purity loss at higher flow rates.",
-                    "simulation_results": [
-                        {
-                            "run_name": "run_01",
-                            "verdict": "inconclusive",
-                            "notes": "solver_error after an infeasible sweep",
-                        },
-                        {
-                            "run_name": "run_02",
-                            "verdict": "inconclusive",
-                            "notes": "solver_error again after a second infeasible sweep",
-                        },
-                    ],
-                }
-            ],
-        },
-    )
-    write_json(
-        root / "agents" / "failures.json",
-        {
-            "_schema_version": "1.0",
-            "failures": [
-                {
-                    "id": "F1",
-                    "title": "Solver Error Due to Constraint Infeasibility",
-                    "severity": "critical",
-                    "symptoms": ["termination_status == 'solver_error'"],
-                    "prevention": [
-                        "Check flow consistency: F1 == Ffeed + Fraf (within 1%) before retrying.",
-                        "Reduce Ffeed by 10-20% if feasibility remains weak.",
-                    ],
-                    "occurrences": [],
-                }
-            ],
-        },
-    )
-
-
-def test_scientist_b_review_routes_acquisition_taxonomy() -> None:
-    candidate_task = {"nc": [2, 2, 2, 2], "seed_name": "reference"}
-    effective_task = {
-        "nc": [2, 2, 2, 2],
+        "run_name": run_name,
+        "nc": list(nc or [2, 2, 2, 2]),
         "seed_name": "reference",
-        "flow": {"Ffeed": 1.3, "F1": 2.0, "Fdes": 1.2, "Fex": 0.8, "Fraf": 0.7, "tstep": 9.4},
-    }
-    base_payload = {
-        "decision": "reject",
-        "reason": "Narrow the search to a better supported near-feasible region.",
-        "comparison_assessment": [
-            "Compared against prior run_name=run_01 status=ok viol=0.12 productivity=0.91."
-        ],
-        "evidence": ["Low violation signal.", "Reasonable productivity signal."],
-        "nc_strategy_assessment": [
-            "Candidate A is weaker because it has less supporting evidence.",
-            "Candidate B is weaker because it is less balanced on violation and productivity.",
-        ],
-        "information_target": "Learn whether a nearby layout improves feasibility without losing productivity.",
-        "alternatives_considered": [
-            "Alternative A rejected because its violation stayed high.",
-            "Alternative B rejected because it did not improve the balance of metrics.",
-        ],
-        "coverage_gap": "underexplored flow region",
-        "hypothesis_connection": "H1",
-        "convergence_assessment": "Stagnating but still informative.",
+        "status": status,
+        "feasible": feasible,
+        "J_validated": j,
+        "metrics": {
+            "productivity_ex_ga_ma": productivity,
+            "purity_ex_meoh_free": purity,
+            "recovery_ex_GA": rga,
+            "recovery_ex_MA": rma,
+        },
+        "constraint_slacks": {"normalized_total_violation": violation},
+        "flow": {"Ffeed": 1.2, "F1": 2.0, "Fdes": 1.1, "Fex": 0.9, "Fraf": 0.8, "tstep": 9.2},
+        "timing": {"wall_seconds": 1.0, "cpu_hours_accounted": 0.001},
     }
 
-    cases = [
-        ("EXPLORE", "llm"),
-        ("EXPLOIT", "llm"),
-        ("VERIFY", "llm"),
+
+def candidate_tasks() -> list[dict[str, object]]:
+    seed = {"name": "reference", "Ffeed": 1.2, "F1": 2.0, "Fdes": 1.1, "Fex": 0.9, "Fraf": 0.8, "tstep": 9.2}
+    return [
+        {"nc": [2, 2, 2, 2], "seed_name": "reference", "seed": dict(seed)},
+        {"nc": [1, 2, 3, 2], "seed_name": "reference", "seed": dict(seed)},
     ]
-    for acquisition_type, expected_mode in cases:
-        payload = dict(base_payload)
-        payload["acquisition_type"] = acquisition_type
-        client = StubClient(payload)
-        note = ar.scientist_b_review(
-            client,
-            candidate_task,
-            effective_task,
-            best_result=None,
-            results=[],
-            args=make_args(),
-            codebase_context_excerpt="",
-            compute_context_excerpt="",
-            constraint_context_excerpt="",
-            nc_strategy_excerpt="",
-            research_excerpt="",
-            current_priorities=[],
-            sqlite_context_excerpt="SQLite context: total_records=0, feasible_records=0",
-            iteration=1,
-        )
-
-        assert note["mode"] == expected_mode
-        assert note["acquisition_type"] == acquisition_type
-        assert note["information_target"] == base_payload["information_target"]
-        assert len(note["alternatives_considered"]) == 2
 
 
-def test_scientist_b_review_preserves_balanced_counterproposal_flow() -> None:
-    candidate_task = {"nc": [2, 2, 2, 2], "seed_name": "reference"}
-    effective_task = {
-        "nc": [2, 2, 2, 2],
-        "seed_name": "reference",
-        "flow": {"Ffeed": 1.3, "F1": 2.0, "Fdes": 1.2, "Fex": 0.8, "Fraf": 0.7, "tstep": 9.4},
-    }
-    payload = {
-        "decision": "approve",
-        "reason": "The candidate is balanced enough to execute.",
+def test_build_evidence_pack_includes_required_feasible_and_infeasible_windows() -> None:
+    results = [
+        sample_result("run_01", feasible=False, status="solver_error", j=None, productivity=0.7, purity=0.5, rga=0.6, rma=0.6, violation=0.5),
+        sample_result("run_02", feasible=False, status="infeasible", j=None, productivity=0.8, purity=0.58, rga=0.7, rma=0.69, violation=0.18),
+        sample_result("run_03", feasible=True, status="ok", j=0.9, productivity=1.0, purity=0.7, rga=0.8, rma=0.81, violation=0.0),
+        sample_result("run_04", feasible=True, status="ok", j=1.1, productivity=1.2, purity=0.78, rga=0.86, rma=0.84, violation=0.0),
+        sample_result("run_05", feasible=False, status="solver_error", j=None, productivity=0.65, purity=0.45, rga=0.55, rma=0.52, violation=0.7),
+        sample_result("run_06", feasible=True, status="ok", j=1.3, productivity=1.4, purity=0.82, rga=0.9, rma=0.88, violation=0.0),
+        sample_result("run_07", feasible=False, status="infeasible", j=None, productivity=0.95, purity=0.62, rga=0.73, rma=0.72, violation=0.05),
+    ]
+    pack = ar.build_evidence_pack(results, recent_limit=5, feasible_limit=3, infeasible_limit=4)
+    assert [row["run_name"] for row in pack["recent_runs"]] == ["run_03", "run_04", "run_05", "run_06", "run_07"]
+    assert len(pack["top_feasible"]) == 3
+    assert [row["run_name"] for row in pack["top_feasible"]] == ["run_06", "run_04", "run_03"]
+    assert 1 <= len(pack["top_infeasible"]) <= 4
+    assert any(str(row["status"]).lower() == "solver_error" for row in pack["top_infeasible"])
+    assert any(float(row["normalized_total_violation"] or 1.0) <= 0.18 for row in pack["top_infeasible"])
+    assert "run_06" in pack["run_name_catalog"]
+    assert "run_01" in pack["run_name_catalog"]
+
+
+def test_scientist_a_invalid_output_retries_once_then_forces_diagnostic_mode() -> None:
+    bad_payload = {
+        "candidate_index": 0,
+        "reason": "Looks good.",
         "acquisition_type": "EXPLOIT",
-        "information_target": "Confirm whether the same layout improves near-feasible points.",
-        "alternatives_considered": [
-            "Alternative A rejected because it lacks flow consistency evidence.",
-            "Alternative B rejected because it does not improve the violation trend.",
-        ],
-        "comparison_assessment": [
-            "Compared run_name=run_01 status=solver_error viol=0.18 productivity=0.74 against the proposed candidate."
-        ],
-        "last_two_run_audit": [],
-        "flowrate_audit": [
-            "Flow audit: Ffeed=1.30, F1=2.00, Fdes=1.20, Fex=0.80, Fraf=0.70, tstep=9.40; the reference flow is balanced."
-        ],
-        "delta_audit": [],
-        "column_topology_audit": [],
-        "physics_audit": "Mass balance and flow-split reasoning support the proposal.",
-        "counterproposal_run": balanced_counterproposal(),
-        "nc_strategy_assessment": [
-            "The candidate nc is stronger than the main alternative because it is more balanced.",
-            "The competitor layout is weaker because its evidence is thinner.",
-        ],
-        "compute_assessment": "The proposal stays within the same compute envelope.",
-        "counterarguments": ["The point is still close to the infeasible boundary."],
-        "required_checks": ["Recheck solver termination and post-solve flow consistency."],
-        "priority_updates": ["Keep the flow-balanced candidate in the queue."],
-        "risk_flags": ["Close to the infeasible boundary."],
+        "evidence": ["good trend"],
+        "comparison_to_previous": ["better than before"],
+        "physics_rationale": "mass balance",
     }
-    client = StubClient(payload)
+    client = QueueClient([json.dumps(bad_payload), json.dumps(bad_payload)])
+    idx, note = ar.scientist_a_pick(
+        client,
+        candidate_tasks(),
+        [
+            sample_result("run_10", feasible=False, status="solver_error", j=None, productivity=0.8, purity=0.58, rga=0.7, rma=0.68, violation=0.2),
+            sample_result("run_11", feasible=True, status="ok", j=1.15, productivity=1.22, purity=0.8, rga=0.87, rma=0.84, violation=0.0),
+        ],
+        tried=set(),
+        args=make_args(),
+        objectives_excerpt="",
+        soul_excerpt="",
+        codebase_context_excerpt="",
+        compute_context_excerpt="",
+        constraint_context_excerpt="",
+        nc_strategy_excerpt="",
+        research_excerpt="",
+        current_priorities=[],
+        sqlite_context_excerpt="SQLite context: total_records=2, feasible_records=1",
+        budget_used=0.0,
+        iteration=1,
+        heuristics_context="",
+        convergence_context="",
+    )
+    assert idx == 0
+    assert note["mode"] == "low_quality_recovery"
+    assert note["low_quality_recovery"] is True
+    assert note["acquisition_type"] == "LOW_QUALITY_RECOVERY"
 
+
+def test_scientist_b_invalid_output_retries_once_then_forces_diagnostic_mode() -> None:
+    client = QueueClient(['{"decision":"reject"}', '{"decision":"reject"}'])
     note = ar.scientist_b_review(
         client,
-        candidate_task,
-        effective_task,
+        task={"nc": [2, 2, 2, 2], "seed_name": "reference"},
+        effective_task={
+            "nc": [2, 2, 2, 2],
+            "seed_name": "reference",
+            "flow": {"Ffeed": 1.2, "F1": 2.0, "Fdes": 1.1, "Fex": 0.9, "Fraf": 0.8, "tstep": 9.2},
+        },
         best_result=None,
-        results=[],
+        results=[sample_result("run_21", feasible=False, status="solver_error", j=None, productivity=0.6, purity=0.5, rga=0.6, rma=0.6, violation=0.4)],
         args=make_args(),
         codebase_context_excerpt="",
         compute_context_excerpt="",
@@ -252,203 +228,145 @@ def test_scientist_b_review_preserves_balanced_counterproposal_flow() -> None:
         sqlite_context_excerpt="SQLite context: total_records=1, feasible_records=0",
         iteration=1,
     )
-
-    assert note["mode"] == "llm"
-    assert note["decision"] == "approve"
-    assert note["acquisition_type"] == "EXPLOIT"
-    assert_balanced_flow(note["counterproposal_run"]["flow_adjustments"])
-    assert note["counterproposal_run"] == balanced_counterproposal()
+    assert note["mode"] == "low_quality_recovery"
+    assert note["low_quality_recovery"] is True
+    assert note["acquisition_type"] == "LOW_QUALITY_RECOVERY"
 
 
-def test_hypothesis_matcher_emits_h1_guidance_for_consecutive_infeasible_pattern(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    make_heuristics_repo(tmp_path)
-    monkeypatch.setattr(ar, "REPO_ROOT", tmp_path)
-
-    context = ar.build_heuristics_context(max_chars=4000)
-    assert "H1" in context
-    assert "Fdes Purity Impact is Non-Linear" in context
-    assert "solver_error after an infeasible sweep" in context
-    assert "solver_error again after a second infeasible sweep" in context
-
-
-def test_failure_recovery_context_emits_f1_flow_consistency_recovery_on_solver_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    make_heuristics_repo(tmp_path)
-    monkeypatch.setattr(ar, "REPO_ROOT", tmp_path)
-
-    context = ar.build_heuristics_context(max_chars=4000)
-    assert "F1" in context
-    assert "Solver Error Due to Constraint Infeasibility" in context
-    assert "termination_status == 'solver_error'" in context
-    assert "Check flow consistency: F1 == Ffeed + Fraf (within 1%)" in context
-
-
-def test_physics_informed_select_prefers_near_feasible_over_untried(tmp_path: Path) -> None:
-    db_path = tmp_path / "agent.sqlite"
-    conn = ar.open_sqlite_db(str(db_path))
-
-    feasible_result = {
-        "run_name": "near_feasible_probe",
-        "nc": [2, 2, 2, 2],
-        "seed_name": "reference",
-        "status": "solver_error",
-        "feasible": False,
-        "J_validated": None,
-        "metrics": {
-            "productivity_ex_ga_ma": 1.10,
-            "purity_ex_meoh_free": 0.63,
-            "recovery_ex_GA": 0.77,
-            "recovery_ex_MA": 0.78,
+def test_scientist_c_arbitration_requires_grounded_evidence_refs() -> None:
+    response = json.dumps(
+        {
+            "decision": "IMPLEMENT_A",
+            "reason": "A is better.",
+            "priority_updates": ["continue"],
+            "diagnostic_focus": "",
+            "revision_request": "",
+            "selected_task_mode": "A",
+            "acquisition_type": "IMPLEMENT_A",
+            "evidence_refs": ["unknown_run_name"],
+        }
+    )
+    client = QueueClient([response], model="stub-model")
+    decision = ar.scientist_c_arbitrate(
+        client,
+        task={"nc": [2, 2, 2, 2], "seed_name": "reference", "seed": {"name": "reference"}},
+        effective_task={
+            "nc": [2, 2, 2, 2],
+            "seed_name": "reference",
+            "flow": {"Ffeed": 1.2, "F1": 2.0, "Fdes": 1.1, "Fex": 0.9, "Fraf": 0.8, "tstep": 9.2},
         },
-        "constraint_slacks": {"normalized_total_violation": 0.01},
-        "solver": {
-            "solver_name": "ipopt",
-            "termination_condition": "solver_error",
-            "solver_options": {"linear_solver": "mumps"},
+        a_note={"decision": "propose", "reason": "based on run_31", "acquisition_type": "EXPLORE", "evidence_refs": ["run_31"]},
+        b_note={
+            "decision": "reject",
+            "reason": "counter from run_31",
+            "comparison_assessment": ["run_name=run_31 productivity=1.0"],
+            "counterproposal_run": {
+                "nc": [2, 2, 2, 2],
+                "flow_adjustments": {"Ffeed": 0.0, "F1": 0.0, "Fdes": 0.0, "Fex": 0.0, "Fraf": 0.0, "tstep": 0.0},
+                "expected_metric_effect": {
+                    "delta_productivity": 0.0,
+                    "delta_purity": 0.0,
+                    "delta_recovery_ga": 0.0,
+                    "delta_recovery_ma": 0.0,
+                    "delta_violation": 0.0,
+                },
+                "physics_justification": "mass balance check",
+            },
         },
-        "timing": {"wall_seconds": 1.0, "cpu_hours_accounted": 0.0003},
-        "flow": {"Ffeed": 1.2, "F1": 2.0, "Fdes": 1.1, "Fex": 0.9, "Fraf": 0.8, "tstep": 9.2},
-    }
-    ar.persist_result_to_sqlite(conn, "agent_run", "search", feasible_result)
+        results=[sample_result("run_31", feasible=False, status="solver_error", j=None, productivity=0.6, purity=0.5, rga=0.6, rma=0.6, violation=0.4)],
+        args=make_args(executive_llm_model="stub-model"),
+        heuristics_context="",
+        current_priorities=[],
+        sqlite_context_excerpt="SQLite context: total_records=1, feasible_records=0",
+        iteration=2,
+        revision_count_recent=0,
+        force_diagnostic_reason="",
+    )
+    assert decision["decision"] == "FORCE_DIAGNOSTIC"
+    assert decision["selected_task_mode"] == "DIAGNOSTIC"
+    assert decision["acquisition_type"] == "FORCE_DIAGNOSTIC"
+    assert decision.get("evidence_refs")
 
-    board = ar.nc_strategy_board(conn, [[1, 2, 3, 2], [2, 2, 2, 2]])
-    ranked = [line for line in board.splitlines() if line.startswith("- rank=")]
-    assert len(ranked) == 2
-    assert "[2, 2, 2, 2]" in ranked[0]
-    assert "[1, 2, 3, 2]" in ranked[1]
-    assert "solver_error=1" in ranked[0]
+
+def test_live_results_jsonl_emits_expected_fields_and_order(tmp_path: Path) -> None:
+    out = tmp_path / "live_results.jsonl"
+    ar.initialize_live_results_stream(out)
+    ar.append_live_results_event(
+        out,
+        {"event": "iteration_start", "job_id": "123", "run_name": "unit", "iteration": 1, "role": "main_loop"},
+    )
+    ar.append_live_results_event(
+        out,
+        {"event": "scientist_a_decision", "job_id": "123", "run_name": "unit", "iteration": 1, "role": "scientist_a_pick", "decision": "EXPLORE"},
+    )
+    ar.append_live_results_event(
+        out,
+        {
+            "event": "simulation_complete",
+            "job_id": "123",
+            "run_name": "unit",
+            "iteration": 1,
+            "role": "simulation",
+            "decision": "EXECUTE",
+            "solver_status": "ok",
+            "feasible": True,
+            "productivity": 1.2,
+        },
+    )
+    lines = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [line["event"] for line in lines] == ["iteration_start", "scientist_a_decision", "simulation_complete"]
+    for line in lines:
+        assert "timestamp_utc" in line
+        assert "job_id" in line
+        assert "run_name" in line
+        assert "iteration" in line
+        assert "role" in line
 
 
-@pytest.mark.parametrize(
-    "consecutive_rejects, expected",
-    [
-        (1, "respect_reject"),
-        (2, "respect_reject"),
-        (3, "override_execute"),
-    ],
-)
-def test_check_systematic_infeasibility_detects_k_consecutive_failures(
-    consecutive_rejects: int, expected: str
-) -> None:
-    args = make_args()
-    tasks = ar.build_search_tasks(args)
-    result = ar.executive_controller_decide(
-        args,
+def test_malformed_responses_do_not_enter_llm_execution_path() -> None:
+    tasks = candidate_tasks()
+    bad_client = QueueClient(["not-json", "still-not-json"])
+    _, a_note = ar.scientist_a_pick(
+        bad_client,
         tasks,
+        [sample_result("run_41", feasible=False, status="solver_error", j=None, productivity=0.7, purity=0.5, rga=0.6, rma=0.6, violation=0.45)],
         tried=set(),
-        candidate_idx=0,
-        candidate_task=tasks[0],
-        b_note={"decision": "reject"},
-        search_results=[],
-        consecutive_rejects=consecutive_rejects,
+        args=make_args(),
+        objectives_excerpt="",
+        soul_excerpt="",
+        codebase_context_excerpt="",
+        compute_context_excerpt="",
+        constraint_context_excerpt="",
+        nc_strategy_excerpt="",
+        research_excerpt="",
+        current_priorities=[],
+        sqlite_context_excerpt="SQLite context: total_records=1, feasible_records=0",
+        budget_used=0.0,
+        iteration=1,
+        heuristics_context="",
+        convergence_context="",
     )
-
-    assert result["decision"] == expected
-    assert "consecutive rejects" in result["reason"].lower()
-    if expected == "override_execute":
-        assert result["executive_override_executed"] is True
-        assert result["forced_task"]["seed_name"] == "reference"
-
-
-def test_random_search_mode_selection_function_avoids_duplicates() -> None:
-    args = make_args(nc_library="1,2,3,2;2,2,2,2", seed_library="notebook")
-    tasks = ar.build_search_tasks(args)
-    keys = [(tuple(task["nc"]), str(task["seed_name"])) for task in tasks]
-
-    assert len(keys) == len(set(keys))
-    assert all(task["seed_name"] == "reference" for task in tasks[:2])
-
-    manual_tasks = [
-        {"nc": [1, 2, 3, 2], "seed_name": "reference"},
-        {"nc": [2, 2, 2, 2], "seed_name": "reference"},
-        {"nc": [1, 2, 3, 2], "seed_name": "seed_02"},
-    ]
-    tried = {(tuple(manual_tasks[0]["nc"]), "reference")}
-    assert ar.deterministic_select(manual_tasks, tried) == 1
-
-
-def test_wasted_reject_acquisition_is_logged_through_convergence_snapshot(tmp_path: Path) -> None:
-    db_path = tmp_path / "agent.sqlite"
-    conn = ar.open_sqlite_db(str(db_path))
-
-    feasible_result = {
-        "run_name": "feasible_top",
-        "nc": [2, 2, 2, 2],
-        "seed_name": "reference",
-        "status": "ok",
-        "feasible": True,
-        "J_validated": 1.25,
-        "metrics": {
-            "productivity_ex_ga_ma": 1.50,
-            "purity_ex_meoh_free": 0.82,
-            "recovery_ex_GA": 0.88,
-            "recovery_ex_MA": 0.86,
+    b_note = ar.scientist_b_review(
+        bad_client,
+        task=tasks[0],
+        effective_task={
+            "nc": [2, 2, 2, 2],
+            "seed_name": "reference",
+            "flow": {"Ffeed": 1.2, "F1": 2.0, "Fdes": 1.1, "Fex": 0.9, "Fraf": 0.8, "tstep": 9.2},
         },
-        "constraint_slacks": {"normalized_total_violation": 0.0},
-        "solver": {
-            "solver_name": "ipopt",
-            "termination_condition": "optimal",
-            "solver_options": {"linear_solver": "mumps"},
-        },
-        "timing": {"wall_seconds": 1.0, "cpu_hours_accounted": 0.0003},
-        "flow": {"Ffeed": 1.2, "F1": 2.0, "Fdes": 1.1, "Fex": 0.9, "Fraf": 0.8, "tstep": 9.2},
-    }
-    wasted_reject_result = {
-        "run_name": "wasted_reject",
-        "nc": [1, 2, 3, 2],
-        "seed_name": "reference",
-        "status": "solver_error",
-        "feasible": False,
-        "J_validated": 0.72,
-        "metrics": {
-            "productivity_ex_ga_ma": 1.05,
-            "purity_ex_meoh_free": 0.64,
-            "recovery_ex_GA": 0.78,
-            "recovery_ex_MA": 0.76,
-        },
-        "constraint_slacks": {"normalized_total_violation": 0.04},
-        "solver": {
-            "solver_name": "ipopt",
-            "termination_condition": "solver_error",
-            "solver_options": {"linear_solver": "mumps"},
-        },
-        "timing": {"wall_seconds": 1.5, "cpu_hours_accounted": 0.0004},
-        "flow": {"Ffeed": 1.1, "F1": 1.9, "Fdes": 1.0, "Fex": 0.9, "Fraf": 0.8, "tstep": 9.0},
-    }
-    ar.persist_result_to_sqlite(conn, "agent_run", "search", feasible_result)
-    ar.persist_result_to_sqlite(conn, "agent_run", "search", wasted_reject_result)
-
-    ar.record_convergence_snapshot(
-        conn,
-        "agent_run",
-        "agent",
-        2,
-        wasted_reject_result,
-        cumulative_wall_seconds=2.5,
-        cumulative_cpu_hours=0.0007,
-        acquisition_type="WASTED_REJECT",
+        best_result=None,
+        results=[sample_result("run_41", feasible=False, status="solver_error", j=None, productivity=0.7, purity=0.5, rga=0.6, rma=0.6, violation=0.45)],
+        args=make_args(),
+        codebase_context_excerpt="",
+        compute_context_excerpt="",
+        constraint_context_excerpt="",
+        nc_strategy_excerpt="",
+        research_excerpt="",
+        current_priorities=[],
+        sqlite_context_excerpt="SQLite context: total_records=1, feasible_records=0",
+        iteration=1,
     )
-
-    row = conn.execute(
-        """
-        SELECT candidate_run_name, best_feasible_run_name, total_feasible, total_runs,
-               nc_layouts_tested, acquisition_type
-        FROM convergence_tracker
-        WHERE agent_run_name = ?
-        ORDER BY sim_number DESC
-        LIMIT 1
-        """,
-        ("agent_run",),
-    ).fetchone()
-
-    assert row is not None
-    candidate_run_name, best_run_name, total_feasible, total_runs, nc_layouts_tested, acquisition_type = row
-    assert candidate_run_name == "wasted_reject"
-    assert best_run_name == "feasible_top"
-    assert total_feasible == 1
-    assert total_runs == 2
-    assert nc_layouts_tested == 2
-    assert acquisition_type == "WASTED_REJECT"
+    assert a_note["mode"] != "llm"
+    assert b_note["mode"] != "llm"
+    assert a_note["acquisition_type"] == "LOW_QUALITY_RECOVERY"
+    assert b_note["acquisition_type"] == "LOW_QUALITY_RECOVERY"
