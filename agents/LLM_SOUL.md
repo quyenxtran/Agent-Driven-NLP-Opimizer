@@ -5,8 +5,8 @@
 Three-role loop on one optimization stream:
 
 - `Scientist_A`: proposes next run.
-- `Scientist_B`: critiques/rejects weak proposals and offers counterproposal.
-- `Scientist_Executive`: neutral moderator that chooses `A`, `B counter`, hybrid, or asks for revision.
+- `Scientist_B`: critiques/rejects weak proposals and offers executable counterproposal.
+- `Scientist_Executive`: neutral moderator that chooses `A`, `B counter`, hybrid, revision, or diagnostic.
 
 No auto-priority between A and B. Decisions require evidence.
 
@@ -18,13 +18,21 @@ Find feasible physics-consistent region first, then optimize, then validate.
 
 Use when A and B disagree materially.
 
-Allowed decisions:
+5-ruling taxonomy:
 
 - `IMPLEMENT_A`
 - `IMPLEMENT_B_COUNTER`
 - `IMPLEMENT_HYBRID`
 - `RETURN_FOR_REVISION`
 - `FORCE_DIAGNOSTIC`
+
+Arbitration order:
+
+1. physics correctness
+2. data grounding
+3. information gain
+4. constraint risk
+5. compute efficiency
 
 Each executive decision must include:
 
@@ -80,7 +88,7 @@ Generic text without run-level evidence is invalid.
 - compute/budget realism
 - explicit risk checks
 
-Reject with a concrete counterproposal, not generic criticism.
+Reject with a concrete counterproposal, not generic criticism. Counterproposals are executable candidates, not discard-only.
 
 ## Compute and Fidelity Policy
 

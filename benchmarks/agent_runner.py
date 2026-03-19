@@ -5,8 +5,10 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import sqlite3
+import sys
 import textwrap
 import time
 import traceback
@@ -99,6 +101,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--executive-top-k-lock",
         type=int,
         default=int(os.environ.get("SMB_EXECUTIVE_TOP_K_LOCK", "5")),
+    )
+    parser.add_argument(
+        "--executive-arbitration-enabled",
+        type=int,
+        default=int(os.environ.get("SMB_EXECUTIVE_ARBITRATION_ENABLED", "1")),
+    )
+    parser.add_argument(
+        "--executive-max-revisions",
+        type=int,
+        default=int(os.environ.get("SMB_EXECUTIVE_MAX_REVISIONS", "1")),
+    )
+    parser.add_argument(
+        "--executive-llm-model",
+        default=os.environ.get("SMB_EXECUTIVE_LLM_MODEL", ""),
+    )
+    parser.add_argument(
+        "--systematic-infeasibility-k",
+        type=int,
+        default=int(os.environ.get("SMB_SYSTEMATIC_INFEASIBILITY_K", "5")),
+    )
+    parser.add_argument(
+        "--random-search-mode",
+        type=int,
+        default=int(os.environ.get("SMB_RANDOM_SEARCH_MODE", "0")),
+    )
+    parser.add_argument(
+        "--method",
+        choices=["agent", "agent_v2", "random"],
+        default=env_or_default("SMB_METHOD", "agent"),
     )
     parser.add_argument(
         "--single-scientist-mode",
@@ -1543,6 +1574,212 @@ def build_heuristics_context(max_chars: int = 4000) -> str:
     return result[:max_chars]
 
 
+def hypothesis_matcher(heuristics_context: str, results: Optional[Sequence[Dict[str, object]]] = None) -> str:
+    lines: List[str] = []
+    capture = False
+    for raw_line in (heuristics_context or "").splitlines():
+        line = raw_line.rstrip()
+        if line.startswith("HYPOTHESES"):
+            capture = True
+        if capture:
+            if line.startswith("FAILURE MODES"):
+                break
+            lines.append(line)
+    if results:
+        recent = [item for item in results[-3:] if isinstance(item, dict)]
+        if recent:
+            lines.append("")
+            lines.append("Recent hypothesis-linked outcomes:")
+            for item in recent:
+                lines.append(
+                    f"- run={item.get('run_name')} status={item.get('status')} "
+                    f"feasible={item.get('feasible')} viol={effective_violation(item):.6g}"
+                )
+    if not lines:
+        return "No hypothesis context available."
+    return compact_prompt_block("\n".join(lines), max_chars=1200, max_lines=36)
+
+
+def failure_recovery_context(heuristics_context: str, results: Optional[Sequence[Dict[str, object]]] = None) -> str:
+    lines: List[str] = []
+    capture = False
+    for raw_line in (heuristics_context or "").splitlines():
+        line = raw_line.rstrip()
+        if line.startswith("FAILURE MODES"):
+            capture = True
+        if capture:
+            lines.append(line)
+    if results:
+        recent = [item for item in results[-3:] if isinstance(item, dict)]
+        if recent:
+            lines.append("")
+            lines.append("Recent recovery signals:")
+            for item in recent:
+                status = str(item.get("status", "")).strip()
+                feasible = bool(item.get("feasible"))
+                if feasible and status == "ok":
+                    continue
+                lines.append(
+                    f"- run={item.get('run_name')} status={status} feasible={feasible} "
+                    f"viol={effective_violation(item):.6g}"
+                )
+    if not lines:
+        return "No failure recovery context available."
+    return compact_prompt_block("\n".join(lines), max_chars=1200, max_lines=36)
+
+
+def apply_flow_adjustments(base_flow: Dict[str, float], flow_adjustments: Optional[Dict[str, float]]) -> Dict[str, float]:
+    keys = ("Ffeed", "F1", "Fdes", "Fex", "Fraf", "tstep")
+    adjusted = {key: float(base_flow.get(key, 0.0)) for key in keys}
+    if not isinstance(flow_adjustments, dict):
+        return adjusted
+    for key in keys:
+        delta = as_float(flow_adjustments.get(key))
+        if delta is None:
+            continue
+        value = adjusted[key] + float(delta)
+        if key == "tstep":
+            adjusted[key] = max(1e-6, value)
+        else:
+            adjusted[key] = max(0.0, value)
+    return adjusted
+
+
+def build_task_from_counterproposal(
+    base_task: Dict[str, object],
+    counterproposal: Dict[str, object],
+    *,
+    effective_task: Optional[Dict[str, object]] = None,
+    mode: str = "counterproposal",
+) -> Dict[str, object]:
+    task_mode = str(mode or "counterproposal").strip().lower()
+    base_nc = list(base_task.get("nc", [])) if isinstance(base_task.get("nc"), list) else []
+    counter_nc = counterproposal.get("nc")
+    if isinstance(counter_nc, list) and len(counter_nc) == 4 and all(isinstance(v, (int, float)) for v in counter_nc):
+        selected_nc = [int(v) for v in counter_nc] if task_mode != "hybrid" else base_nc
+    else:
+        selected_nc = base_nc
+    base_seed = base_task.get("seed")
+    seed_name = str(base_task.get("seed_name", counterproposal.get("seed_name", "")))
+    if effective_task and isinstance(effective_task.get("flow"), dict):
+        base_flow = {k: float(v) for k, v in effective_task.get("flow", {}).items() if isinstance(v, (int, float))}
+    else:
+        base_flow = {}
+    flow_adjustments = counterproposal.get("flow_adjustments")
+    flow_override = apply_flow_adjustments(base_flow, flow_adjustments if isinstance(flow_adjustments, dict) else None)
+    return {
+        "nc": selected_nc,
+        "seed_name": seed_name,
+        "seed": base_seed,
+        "flow_override": flow_override,
+        "counterproposal_run": counterproposal,
+        "task_mode": task_mode,
+        "source_task": dict(base_task),
+    }
+
+
+def physics_informed_select(
+    tasks: List[Dict[str, object]],
+    tried: set[Tuple[Tuple[int, ...], str]],
+    results: List[Dict[str, object]],
+    *,
+    best_result: Optional[Dict[str, object]] = None,
+    preferred_nc: Optional[Sequence[int]] = None,
+    preferred_seed_name: Optional[str] = None,
+    reason: str = "",
+) -> Tuple[int, Dict[str, object]]:
+    remaining: List[Tuple[int, Dict[str, object]]] = []
+    for idx, task in enumerate(tasks):
+        key = (tuple(task["nc"]), str(task["seed_name"]))
+        if key not in tried:
+            remaining.append((idx, task))
+    if not remaining:
+        idx = deterministic_select(tasks, tried)
+        return idx, {
+            "mode": "physics_informed_fallback",
+            "reason": "No untried task remains; falling back to deterministic selection.",
+        }
+
+    preferred_nc_tuple = tuple(int(v) for v in preferred_nc) if preferred_nc is not None else None
+    best_nc_tuple = tuple(best_result.get("nc", [])) if isinstance(best_result, dict) else None
+    recent_bad_ncs = [
+        tuple(item.get("nc", []))
+        for item in results[-3:]
+        if isinstance(item, dict) and (
+            not bool(item.get("feasible"))
+            or str(item.get("status", "")).strip().lower() in {"solver_error", "infeasible", "failed", "error", "other"}
+        )
+    ]
+
+    def score(item: Dict[str, object]) -> float:
+        nc = tuple(item.get("nc", []))
+        score_value = nc_prior_score(nc)
+        if preferred_nc_tuple is not None and nc == preferred_nc_tuple:
+            score_value += 250.0
+        if best_nc_tuple is not None and nc == best_nc_tuple:
+            score_value += 125.0
+        if nc in recent_bad_ncs:
+            score_value += 90.0
+        if is_reference_seed_name(item.get("seed_name")):
+            score_value += 60.0
+        if preferred_seed_name and str(item.get("seed_name", "")) == str(preferred_seed_name):
+            score_value += 35.0
+        if any(
+            tuple(result.get("nc", [])) == nc and str(result.get("seed_name", "")) == str(item.get("seed_name", ""))
+            for result in results
+        ):
+            score_value -= 10.0
+        return score_value
+
+    ranked = sorted(remaining, key=lambda entry: score(entry[1]), reverse=True)
+    idx, task = ranked[0]
+    selected_score = score(task)
+    return idx, {
+        "mode": "physics_informed",
+        "reason": reason or "Physics-informed selection chose the highest-scoring untried diagnostic task.",
+        "selected_nc": list(task.get("nc", [])),
+        "selected_seed_name": str(task.get("seed_name", "")),
+        "score": selected_score,
+        "recent_bad_ncs": [list(nc) for nc in recent_bad_ncs],
+    }
+
+
+def check_systematic_infeasibility(results: List[Dict[str, object]], k: int) -> Dict[str, object]:
+    window = max(1, int(k))
+    recent = results[-window:]
+    if len(recent) < window:
+        return {
+            "triggered": False,
+            "window": window,
+            "recent_count": len(recent),
+            "bad_count": 0,
+            "reason": "Not enough recent results to assess systematic infeasibility.",
+        }
+    bad_entries: List[str] = []
+    for item in recent:
+        status = str(item.get("status", "")).strip().lower()
+        feasible = bool(item.get("feasible"))
+        bad_status = status in {"solver_error", "infeasible", "failed", "error", "other"}
+        high_violation = effective_violation(item) >= 1e-3
+        if (not feasible) or bad_status or high_violation:
+            bad_entries.append(
+                f"run={item.get('run_name')} status={item.get('status')} feasible={item.get('feasible')} viol={effective_violation(item):.6g}"
+            )
+    triggered = len(bad_entries) >= window
+    return {
+        "triggered": triggered,
+        "window": window,
+        "recent_count": len(recent),
+        "bad_count": len(bad_entries),
+        "bad_entries": bad_entries,
+        "reason": (
+            f"Systematic infeasibility trigger fired across the last {window} results."
+            if triggered
+            else f"Systematic infeasibility trigger not met ({len(bad_entries)}/{window} bad results in the rolling window)."
+        ),
+    }
+
+
 def utc_now_text() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -2087,6 +2324,8 @@ def append_iteration_research(
     if isinstance(executive_note, dict):
         lines.append(f"- executive_decision: {executive_note.get('decision')}")
         lines.append(f"- executive_reason: {executive_note.get('reason')}")
+        if executive_note.get("acquisition_type"):
+            lines.append(f"- executive_acquisition_type: {executive_note.get('acquisition_type')}")
         if executive_note.get("forced_task"):
             lines.append(f"- executive_forced_task: {executive_note.get('forced_task')}")
         if executive_note.get("forced_reason"):
@@ -2127,6 +2366,7 @@ def append_result_research(path: Path, result: Dict[str, object], phase: str) ->
     if isinstance(execution_policy, dict):
         lines.append(f"  - execution_policy_note: {execution_policy.get('note')}")
         lines.append(f"  - execution_policy_fidelity_override: {execution_policy.get('fidelity_override')}")
+        lines.append(f"  - execution_policy_flow_override: {execution_policy.get('flow_override')}")
     comp = composition_metrics_from_result(result)
     if comp is not None:
         lines.append(
@@ -2831,6 +3071,8 @@ def scientist_a_pick(
     compute_compact = compact_prompt_block(compute_context_excerpt, max_chars=260, max_lines=12)
     constraint_compact = compact_prompt_block(constraint_context_excerpt, max_chars=420, max_lines=16)
     heuristics_compact = compact_prompt_block(heuristics_context, max_chars=450, max_lines=16)
+    hypothesis_compact = hypothesis_matcher(heuristics_context, results)
+    failure_compact = failure_recovery_context(heuristics_context, results)
     convergence_compact = compact_prompt_block(convergence_context, max_chars=420, max_lines=16)
     research_compact = compact_prompt_block(research_excerpt, max_chars=320, max_lines=12)
     nc_strategy_compact = compact_prompt_block(nc_strategy_excerpt, max_chars=520, max_lines=18)
@@ -2867,6 +3109,12 @@ def scientist_a_pick(
 
             Accumulated heuristics (hypotheses and known failure modes):
             {heuristics_compact}
+
+            Relevant hypotheses:
+            {compact_prompt_block(hypothesis_compact, max_chars=700, max_lines=20)}
+
+            Failure recovery context:
+            {compact_prompt_block(failure_compact, max_chars=700, max_lines=20)}
 
             Convergence progress:
             {convergence_compact}
@@ -3589,11 +3837,249 @@ def scientist_b_review(
     return {"mode": "deterministic", **default}
 
 
+def scientist_c_arbitrate(
+    client: OpenAICompatClient,
+    task: Dict[str, object],
+    effective_task: Dict[str, object],
+    a_note: Dict[str, object],
+    b_note: Dict[str, object],
+    results: List[Dict[str, object]],
+    args: argparse.Namespace,
+    heuristics_context: str,
+    current_priorities: List[str],
+    sqlite_context_excerpt: str,
+    iteration: int,
+    *,
+    revision_count_recent: int = 0,
+    force_diagnostic_reason: str = "",
+) -> Dict[str, object]:
+    default_counterproposal = b_note.get("counterproposal_run") if isinstance(b_note.get("counterproposal_run"), dict) else None
+    default_decision = "IMPLEMENT_B_COUNTER" if default_counterproposal else "IMPLEMENT_A"
+    best_result = rank_any_results(results)[0] if results else None
+    recent_two_block, _ = recent_two_run_review_context(results)
+    hypothesis_compact = hypothesis_matcher(heuristics_context, results)
+    failure_compact = failure_recovery_context(heuristics_context, results)
+    recent_two_compact = compact_prompt_block(recent_two_block, max_chars=420, max_lines=16)
+    heuristics_compact = compact_prompt_block(heuristics_context, max_chars=520, max_lines=18)
+    sqlite_compact = compact_prompt_block(sqlite_context_excerpt, max_chars=520, max_lines=18)
+    priorities_compact = "\n".join(f"- {p}" for p in current_priorities[:6]) or "- none"
+    a_brief = {
+        "decision": str(a_note.get("decision", "")).strip(),
+        "reason": str(a_note.get("reason", "")).strip(),
+        "acquisition_type": str(a_note.get("acquisition_type", "")).strip(),
+        "candidate_index": a_note.get("candidate_index"),
+        "candidate": {"nc": list(task.get("nc", [])), "seed_name": str(task.get("seed_name", ""))},
+        "evidence": normalize_text_list(a_note.get("evidence"), max_items=4),
+        "coverage_gap": str(a_note.get("coverage_gap", "")).strip(),
+        "hypothesis_connection": str(a_note.get("hypothesis_connection", "")).strip(),
+        "convergence_assessment": str(a_note.get("convergence_assessment", "")).strip(),
+        "diagnostic_hypothesis": str(a_note.get("diagnostic_hypothesis", "")).strip(),
+    }
+    b_brief = {
+        "decision": str(b_note.get("decision", "")).strip(),
+        "reason": str(b_note.get("reason", "")).strip(),
+        "comparison_assessment": normalize_text_list(b_note.get("comparison_assessment"), max_items=4),
+        "counterproposal_run": b_note.get("counterproposal_run"),
+        "nc_strategy_assessment": normalize_text_list(b_note.get("nc_strategy_assessment"), max_items=4),
+        "physics_audit": str(b_note.get("physics_audit", "")).strip(),
+        "risk_flags": normalize_text_list(b_note.get("risk_flags"), max_items=4),
+    }
+    try:
+        exec_model = str(getattr(args, "executive_llm_model", "")).strip() or client.model
+        exec_client = client
+        if exec_model != client.model:
+            exec_client = OpenAICompatClient(
+                client.base_url,
+                exec_model,
+                client.enabled,
+                api_key=client.api_key,
+                fallback_enabled=client.fallback_enabled,
+                fallback_base_url=client.fallback_base_url,
+                fallback_model=client.fallback_model,
+                fallback_api_key=client.fallback_api_key,
+                conversation_stream_path=client.conversation_stream_path,
+                timeout_seconds=client.timeout_seconds,
+                max_tokens=client.max_tokens,
+                max_retries=client.max_retries,
+                retry_backoff_seconds=client.retry_backoff_seconds,
+                conversation_log_mode=client.conversation_log_mode,
+                conversation_response_max_chars=client.conversation_response_max_chars,
+            )
+        prompt = textwrap.dedent(
+            f"""
+            You are Scientist_C, the executive arbiter for SMB search.
+            Choose exactly one taxonomy label:
+            IMPLEMENT_A, IMPLEMENT_B_COUNTER, IMPLEMENT_HYBRID, RETURN_FOR_REVISION, FORCE_DIAGNOSTIC.
+            Be strict about physics, evidence quality, and budget impact.
+            If the B counterproposal is weak or inconsistent, prefer revision or diagnostic over blind execution.
+
+            Current candidate:
+            {json.dumps({"nc": list(task.get("nc", [])), "seed_name": str(task.get("seed_name", "")), "flow": effective_task.get("flow", {})}, separators=(",", ":"))}
+
+            Scientist_A summary:
+            {json.dumps(a_brief, separators=(",", ":"))}
+
+            Scientist_B summary:
+            {json.dumps(b_brief, separators=(",", ":"))}
+
+            Current best result:
+            {summarize_result(best_result) if best_result else "None yet."}
+
+            Recent two completed runs:
+            {recent_two_compact}
+
+            Current priority board:
+            {priorities_compact}
+
+            Hypotheses:
+            {hypothesis_compact}
+
+            Failure recovery context:
+            {failure_compact}
+
+            Heuristics summary:
+            {heuristics_compact}
+
+            SQLite context:
+            {sqlite_compact}
+
+            If you choose RETURN_FOR_REVISION, keep the request bounded and actionable.
+            If revision pressure is already high, switch to FORCE_DIAGNOSTIC.
+            If a diagnostic is needed, prefer a task that tests the suspected failure mode directly.
+
+            Respond with JSON only:
+            {{
+              "decision": "IMPLEMENT_A | IMPLEMENT_B_COUNTER | IMPLEMENT_HYBRID | RETURN_FOR_REVISION | FORCE_DIAGNOSTIC",
+              "reason": "<brief reason>",
+              "priority_updates": ["..."],
+              "diagnostic_focus": "<what to test if forcing diagnostic>",
+              "revision_request": "<what revision should address>",
+              "selected_task_mode": "<A | B_COUNTER | HYBRID | DIAGNOSTIC>",
+              "acquisition_type": "<compact label for logging>"
+            }}
+            """
+        ).strip()
+        prompt = compact_prompt_block(prompt, max_chars=2600, max_lines=90)
+        raw = exec_client.chat(
+            "You are a decisive process executive. Return JSON only.",
+            prompt,
+            conversation_role="scientist_c_arbitrate",
+            temperature=0.1,
+            metadata={
+                "iteration": iteration,
+                "candidate_nc": task.get("nc"),
+                "candidate_seed_name": task.get("seed_name"),
+                "revision_count_recent": revision_count_recent,
+                "force_diagnostic_reason": force_diagnostic_reason,
+                "executive_model": exec_model,
+            },
+        )
+        if exec_client is not client:
+            client.conversations.extend(exec_client.conversations)
+            if exec_client.last_backend != "none":
+                client.last_backend = exec_client.last_backend
+        data = client.extract_json(raw)
+        if isinstance(data, dict):
+            decision = str(data.get("decision", "")).strip().upper()
+            valid = {
+                "IMPLEMENT_A",
+                "IMPLEMENT_B_COUNTER",
+                "IMPLEMENT_HYBRID",
+                "RETURN_FOR_REVISION",
+                "FORCE_DIAGNOSTIC",
+            }
+            if decision in valid:
+                data["decision"] = decision
+                data["reason"] = str(data.get("reason", "")).strip()
+                data["priority_updates"] = normalize_text_list(data.get("priority_updates"), max_items=8)
+                data["diagnostic_focus"] = str(data.get("diagnostic_focus", "")).strip()
+                data["revision_request"] = str(data.get("revision_request", "")).strip()
+                data["selected_task_mode"] = str(data.get("selected_task_mode", "")).strip().upper()
+                data["acquisition_type"] = str(data.get("acquisition_type", "")).strip().upper()
+                data["llm_backend"] = exec_client.last_backend
+                data["raw"] = raw
+                data["mode"] = "llm"
+                if not data["acquisition_type"]:
+                    data["acquisition_type"] = decision
+                return data
+    except Exception as exc:
+        fallback = {
+            "mode": "deterministic_error",
+            "reason": f"Scientist_C exception fallback: {type(exc).__name__}: {exc}",
+            "priority_updates": [
+                "Executive arbitration failed; use deterministic fallback based on counterproposal quality and diagnostics."
+            ],
+        }
+        if default_counterproposal is not None:
+            fallback["decision"] = "IMPLEMENT_B_COUNTER"
+            fallback["acquisition_type"] = "IMPLEMENT_B_COUNTER"
+        else:
+            fallback["decision"] = "IMPLEMENT_A"
+            fallback["acquisition_type"] = "IMPLEMENT_A"
+        return fallback
+
+    counterproposal_valid = isinstance(default_counterproposal, dict)
+    if force_diagnostic_reason:
+        return {
+            "mode": "deterministic",
+            "decision": "FORCE_DIAGNOSTIC",
+            "reason": force_diagnostic_reason,
+            "priority_updates": [
+                "Systematic infeasibility trigger requested an immediate diagnostic execution."
+            ],
+            "diagnostic_focus": force_diagnostic_reason,
+            "selected_task_mode": "DIAGNOSTIC",
+            "acquisition_type": "FORCE_DIAGNOSTIC",
+        }
+    if revision_count_recent < max(0, int(getattr(args, "executive_max_revisions", 1))):
+        return {
+            "mode": "deterministic",
+            "decision": "RETURN_FOR_REVISION",
+            "reason": "Deterministic fallback prefers a bounded revision request before forcing an execution choice.",
+            "priority_updates": [
+                "Return the task for one more revision window before executing a counterproposal."
+            ],
+            "revision_request": "Tighten the counterproposal and make the diagnostic target more specific.",
+            "selected_task_mode": "REVISION",
+            "acquisition_type": "RETURN_FOR_REVISION",
+        }
+    if counterproposal_valid:
+        task_nc = list(task.get("nc", []))
+        cp_nc = default_counterproposal.get("nc") if isinstance(default_counterproposal, dict) else None
+        if isinstance(cp_nc, list) and len(cp_nc) == 4 and cp_nc != task_nc:
+            decision = "IMPLEMENT_B_COUNTER"
+        elif best_result and effective_violation(best_result) > 1e-3:
+            decision = "IMPLEMENT_HYBRID"
+        else:
+            decision = default_decision
+        return {
+            "mode": "deterministic",
+            "decision": decision,
+            "reason": "Deterministic fallback selected the strongest available non-revision action.",
+            "priority_updates": [
+                "Use the best available executable task when arbitration is unavailable."
+            ],
+            "selected_task_mode": "B_COUNTER" if decision == "IMPLEMENT_B_COUNTER" else ("HYBRID" if decision == "IMPLEMENT_HYBRID" else "A"),
+            "acquisition_type": decision,
+        }
+    return {
+        "mode": "deterministic",
+        "decision": "IMPLEMENT_A",
+        "reason": "Deterministic fallback keeps the original proposal because no valid counterproposal is available.",
+        "priority_updates": [
+            "Fallback to Scientist_A proposal when no usable counterproposal exists."
+        ],
+        "selected_task_mode": "A",
+        "acquisition_type": "IMPLEMENT_A",
+    }
+
+
 def execute_search_task(
     args: argparse.Namespace,
     task: Dict[str, object],
     *,
     fidelity_override: Optional[Dict[str, int]] = None,
+    flow_override: Optional[Dict[str, float]] = None,
     execution_note: str = "",
 ) -> Dict[str, object]:
     base = configure_stage_args(make_stage_args("optimize-layouts"), args)
@@ -3617,17 +4103,37 @@ def execute_search_task(
         candidate_args.nfex = max(1, int(fidelity_override.get("nfex", candidate_args.nfex)))
         candidate_args.nfet = max(1, int(fidelity_override.get("nfet", candidate_args.nfet)))
         candidate_args.ncp = max(1, int(fidelity_override.get("ncp", candidate_args.ncp)))
+    if isinstance(flow_override, dict):
+        flow_map = {
+            "Ffeed": "ffeed",
+            "F1": "f1",
+            "Fdes": "fdes",
+            "Fex": "fex",
+            "Fraf": "fraf",
+            "tstep": "tstep",
+        }
+        for key, attr in flow_map.items():
+            value = as_float(flow_override.get(key))
+            if value is None:
+                continue
+            setattr(candidate_args, attr, float(value))
     candidate_args.run_name = f"{args.run_name}_search_nc_{'-'.join(str(v) for v in task['nc'])}_{candidate_args.seed_name}"
     result = rs.evaluate_optimized_layout(candidate_args, tuple(task["nc"]))
-    if isinstance(fidelity_override, dict) or execution_note:
+    if isinstance(fidelity_override, dict) or isinstance(flow_override, dict) or execution_note:
         result["execution_policy"] = {
             "fidelity_override": fidelity_override or {},
+            "flow_override": flow_override or {},
             "note": execution_note,
         }
     return result
 
 
-def effective_search_task(args: argparse.Namespace, task: Dict[str, object]) -> Dict[str, object]:
+def effective_search_task(
+    args: argparse.Namespace,
+    task: Dict[str, object],
+    *,
+    flow_override: Optional[Dict[str, float]] = None,
+) -> Dict[str, object]:
     base = configure_stage_args(make_stage_args("optimize-layouts"), args)
     tstep_bounds = rs.parse_bounds(base.tstep_bounds)
     ffeed_bounds = rs.parse_bounds(base.ffeed_bounds)
@@ -3645,6 +4151,20 @@ def effective_search_task(args: argparse.Namespace, task: Dict[str, object]) -> 
         fraf_bounds=fraf_bounds,
         f1_bounds=f1_bounds,
     )
+    if isinstance(flow_override, dict):
+        flow_map = {
+            "Ffeed": "ffeed",
+            "F1": "f1",
+            "Fdes": "fdes",
+            "Fex": "fex",
+            "Fraf": "fraf",
+            "tstep": "tstep",
+        }
+        for key, attr in flow_map.items():
+            value = as_float(flow_override.get(key))
+            if value is None:
+                continue
+            setattr(candidate_args, attr, float(value))
     return {
         "nc": list(task["nc"]),
         "seed_name": str(candidate_args.seed_name),
@@ -3888,6 +4408,15 @@ def main() -> int:
     tried: set[Tuple[Tuple[int, ...], str]] = set()
     heuristics_excerpt = build_heuristics_context(max_chars=900)
     sim_counter = 0  # global simulation counter for convergence tracking
+    method_explicit = any(arg == "--method" or arg.startswith("--method=") for arg in sys.argv[1:])
+    runtime_method = str(getattr(args, "method", "agent")).strip().lower()
+    if bool(int(getattr(args, "random_search_mode", 0))) and not method_explicit:
+        runtime_method = "random"
+    if runtime_method not in {"agent", "agent_v2", "random"}:
+        runtime_method = "agent"
+    force_diagnostic_next_iteration = False
+    force_diagnostic_reason = ""
+    revision_iterations: List[int] = []
 
     try:
         progress_log("AGENT: init start")
@@ -3955,6 +4484,274 @@ def main() -> int:
             nc_strategy_excerpt = nc_strategy_board(sqlite_conn, nc_library_values)
             research_excerpt = read_research_tail(research_path, args.research_tail_chars)
             convergence_excerpt = sqlite_convergence_context(sqlite_conn, args.run_name)
+            best_so_far = rank_any_results(search_results)[0] if search_results else None
+            if force_diagnostic_next_iteration:
+                diag_idx, diag_note = physics_informed_select(
+                    search_tasks,
+                    tried,
+                    search_results,
+                    best_result=best_so_far,
+                    reason=force_diagnostic_reason or "Systematic infeasibility requested a diagnostic task.",
+                )
+                task = search_tasks[diag_idx]
+                task_key = (tuple(task["nc"]), str(task["seed_name"]))
+                if task_key in tried:
+                    break
+                effective_task = effective_search_task(args, task, flow_override=task.get("flow_override") if isinstance(task.get("flow_override"), dict) else None)
+                a_note = {
+                    "mode": "diagnostic_forced",
+                    "decision": "FORCE_DIAGNOSTIC",
+                    "reason": diag_note.get("reason", force_diagnostic_reason or "Forced diagnostic task selection."),
+                    "priority_updates": [
+                        "Systematic infeasibility triggered an immediate diagnostic execution."
+                    ],
+                    "acquisition_type": "FORCE_DIAGNOSTIC",
+                }
+                b_note = {
+                    "mode": "diagnostic_forced",
+                    "decision": "approve",
+                    "reason": "Diagnostic override bypassed Scientist_B review.",
+                    "priority_updates": [
+                        "Diagnostic override bypassed Scientist_B so the next iteration can probe failure structure."
+                    ],
+                    "acquisition_type": "FORCE_DIAGNOSTIC",
+                    "risk_flags": [force_diagnostic_reason] if force_diagnostic_reason else [],
+                }
+                scientist_a_log.append(
+                    {
+                        "task": task,
+                        "proposed_task": task,
+                        "effective_task_after_policy": effective_task,
+                        "decision": a_note,
+                    }
+                )
+                scientist_b_log.append(
+                    {
+                        "task": task,
+                        "reviewed_task": task,
+                        "effective_task_after_policy": effective_task,
+                        "decision": b_note,
+                    }
+                )
+                executive_note = {
+                    "decision": "FORCE_DIAGNOSTIC",
+                    "reason": diag_note.get("reason", force_diagnostic_reason or "Forced diagnostic execution."),
+                    "priority_updates": [
+                        "Systematic infeasibility trigger forced a diagnostic run next iteration."
+                    ],
+                    "acquisition_type": "FORCE_DIAGNOSTIC",
+                    "diagnostic_focus": diag_note.get("reason", force_diagnostic_reason or ""),
+                }
+                executive_log.append({"task": task, "decision": executive_note})
+                current_priorities = merge_priority_board(current_priorities, a_note, b_note, executive_note)
+                append_iteration_research(
+                    research_path,
+                    search_iteration,
+                    task,
+                    a_note,
+                    b_note,
+                    scientist_a_proposed_task=task,
+                    effective_task_after_policy=effective_task,
+                    scientist_b_reviewed_task=task,
+                    executive_note=executive_note,
+                )
+                tried.add(task_key)
+                execution_policy = search_execution_policy(args, search_tasks, search_results, task)
+                if execution_policy.get("reason"):
+                    append_research(
+                        research_path,
+                        f"- execution_policy: {execution_policy.get('reason')}\n",
+                    )
+                progress_log(f"AGENT: execute search diagnostic_forced start task={task}")
+                result = execute_search_task(
+                    args,
+                    task,
+                    fidelity_override=(
+                        execution_policy.get("fidelity_override")
+                        if isinstance(execution_policy.get("fidelity_override"), dict)
+                        else None
+                    ),
+                    flow_override=effective_task.get("flow") if isinstance(effective_task.get("flow"), dict) else None,
+                    execution_note=str(execution_policy.get("reason", "")),
+                )
+                progress_log(
+                    "AGENT: execute search diagnostic_forced done "
+                    + f"run={result.get('run_name')} status={result.get('status')} "
+                    + f"wall_s={float(((result.get('timing') or {}).get('wall_seconds') or 0.0)):.1f}"
+                )
+                result["diagnostic_forced"] = True
+                result["diagnostic_forced_reason"] = force_diagnostic_reason
+                search_results.append(result)
+                persist_result_to_sqlite(sqlite_conn, args.run_name, "search", result)
+                sim_counter += 1
+                record_convergence_snapshot(
+                    sqlite_conn,
+                    args.run_name,
+                    runtime_method,
+                    sim_counter,
+                    result,
+                    search_hours_used * 3600.0,
+                    search_hours_used,
+                    acquisition_type="FORCE_DIAGNOSTIC",
+                )
+                heuristics_excerpt = build_heuristics_context(max_chars=900)
+                append_result_research(research_path, result, "search")
+                append_research(
+                    research_path,
+                    "\n#### Insights and Trends Update\n"
+                    f"- timestamp_utc: {utc_now_text()}\n"
+                    + sqlite_layout_trend_table(sqlite_conn)
+                    + "\n",
+                )
+                ledger.append(
+                    {
+                        "phase": "search_diagnostic_forced",
+                        "run_name": result.get("run_name"),
+                        "status": result.get("status"),
+                        "timing": result.get("timing"),
+                    }
+                )
+                timing = result.get("timing") or {}
+                search_hours_used += float(timing.get("wall_seconds", 0.0)) / 3600.0
+                infeasibility_state = check_systematic_infeasibility(
+                    search_results,
+                    int(getattr(args, "systematic_infeasibility_k", 5)),
+                )
+                if bool(infeasibility_state.get("triggered")):
+                    force_diagnostic_next_iteration = True
+                    force_diagnostic_reason = str(infeasibility_state.get("reason", ""))
+                else:
+                    force_diagnostic_next_iteration = False
+                    force_diagnostic_reason = ""
+                continue
+            if runtime_method == "random":
+                remaining_indices = [
+                    i for i, candidate in enumerate(search_tasks) if (tuple(candidate["nc"]), str(candidate["seed_name"])) not in tried
+                ]
+                if not remaining_indices:
+                    break
+                idx = random.choice(remaining_indices)
+                task = search_tasks[idx]
+                task_key = (tuple(task["nc"]), str(task["seed_name"]))
+                effective_task = effective_search_task(args, task, flow_override=task.get("flow_override") if isinstance(task.get("flow_override"), dict) else None)
+                a_note = {
+                    "mode": "random_search",
+                    "decision": "random_select",
+                    "reason": "Random search mode bypassed Scientist_A.",
+                    "priority_updates": [
+                        "Random search mode active: uniform untried task selected without LLM review."
+                    ],
+                    "acquisition_type": "RANDOM_SEARCH",
+                }
+                b_note = {
+                    "mode": "random_search",
+                    "decision": "approve",
+                    "reason": "Random search mode bypassed Scientist_B.",
+                    "priority_updates": [
+                        "Random search mode active: Scientist_B review was bypassed."
+                    ],
+                    "acquisition_type": "RANDOM_SEARCH",
+                }
+                executive_note = {
+                    "decision": "not_needed",
+                    "reason": "Random search mode bypassed executive arbitration.",
+                    "priority_updates": [],
+                    "acquisition_type": "RANDOM_SEARCH",
+                }
+                scientist_a_log.append(
+                    {
+                        "task": task,
+                        "proposed_task": task,
+                        "effective_task_after_policy": effective_task,
+                        "decision": a_note,
+                    }
+                )
+                scientist_b_log.append(
+                    {
+                        "task": task,
+                        "reviewed_task": task,
+                        "effective_task_after_policy": effective_task,
+                        "decision": b_note,
+                    }
+                )
+                executive_log.append({"task": task, "decision": executive_note})
+                current_priorities = merge_priority_board(current_priorities, a_note, b_note, executive_note)
+                append_iteration_research(
+                    research_path,
+                    search_iteration,
+                    task,
+                    a_note,
+                    b_note,
+                    scientist_a_proposed_task=task,
+                    effective_task_after_policy=effective_task,
+                    scientist_b_reviewed_task=task,
+                    executive_note=executive_note,
+                )
+                tried.add(task_key)
+                execution_policy = search_execution_policy(args, search_tasks, search_results, task)
+                if execution_policy.get("reason"):
+                    append_research(
+                        research_path,
+                        f"- execution_policy: {execution_policy.get('reason')}\n",
+                    )
+                progress_log(f"AGENT: execute search_random start task={task}")
+                result = execute_search_task(
+                    args,
+                    task,
+                    fidelity_override=(
+                        execution_policy.get("fidelity_override")
+                        if isinstance(execution_policy.get("fidelity_override"), dict)
+                        else None
+                    ),
+                    flow_override=effective_task.get("flow") if isinstance(effective_task.get("flow"), dict) else None,
+                    execution_note=str(execution_policy.get("reason", "")),
+                )
+                progress_log(
+                    "AGENT: execute search_random done "
+                    + f"run={result.get('run_name')} status={result.get('status')} "
+                    + f"wall_s={float(((result.get('timing') or {}).get('wall_seconds') or 0.0)):.1f}"
+                )
+                result["random_search_mode"] = True
+                search_results.append(result)
+                persist_result_to_sqlite(sqlite_conn, args.run_name, "search", result)
+                sim_counter += 1
+                record_convergence_snapshot(
+                    sqlite_conn,
+                    args.run_name,
+                    runtime_method,
+                    sim_counter,
+                    result,
+                    search_hours_used * 3600.0,
+                    search_hours_used,
+                    acquisition_type="RANDOM_SEARCH",
+                )
+                heuristics_excerpt = build_heuristics_context(max_chars=900)
+                append_result_research(research_path, result, "search")
+                append_research(
+                    research_path,
+                    "\n#### Insights and Trends Update\n"
+                    f"- timestamp_utc: {utc_now_text()}\n"
+                    + sqlite_layout_trend_table(sqlite_conn)
+                    + "\n",
+                )
+                ledger.append(
+                    {
+                        "phase": "search_random",
+                        "run_name": result.get("run_name"),
+                        "status": result.get("status"),
+                        "timing": result.get("timing"),
+                    }
+                )
+                timing = result.get("timing") or {}
+                search_hours_used += float(timing.get("wall_seconds", 0.0)) / 3600.0
+                infeasibility_state = check_systematic_infeasibility(
+                    search_results,
+                    int(getattr(args, "systematic_infeasibility_k", 5)),
+                )
+                if bool(infeasibility_state.get("triggered")):
+                    force_diagnostic_next_iteration = True
+                    force_diagnostic_reason = str(infeasibility_state.get("reason", ""))
+                continue
             try:
                 progress_log(f"AGENT: Scientist_A pick start (iter={search_iteration})")
                 idx, a_note = scientist_a_pick(
@@ -4077,6 +4874,264 @@ def main() -> int:
             else:
                 consecutive_rejects += 1
 
+            counterproposal = b_note.get("counterproposal_run") if isinstance(b_note.get("counterproposal_run"), dict) else None
+            counterproposal_valid = False
+            if isinstance(counterproposal, dict):
+                cp_nc = counterproposal.get("nc")
+                cp_flow = counterproposal.get("flow_adjustments")
+                cp_effect = counterproposal.get("expected_metric_effect")
+                cp_physics = str(counterproposal.get("physics_justification", "")).strip()
+                valid_nc = isinstance(cp_nc, list) and len(cp_nc) == 4 and all(isinstance(v, (int, float)) for v in cp_nc)
+                valid_flow = isinstance(cp_flow, dict) and any(isinstance(cp_flow.get(key), (int, float)) for key in ("Ffeed", "F1", "Fdes", "Fex", "Fraf", "tstep"))
+                valid_effect = isinstance(cp_effect, dict) and any(isinstance(cp_effect.get(key), (int, float)) for key in ("delta_productivity", "delta_purity", "delta_recovery_ga", "delta_recovery_ma", "delta_violation"))
+                counterproposal_valid = valid_nc and valid_flow and valid_effect and bool(cp_physics)
+
+            if (not b_approved) and bool(int(getattr(args, "executive_arbitration_enabled", 1))) and counterproposal_valid:
+                c_note = scientist_c_arbitrate(
+                    client,
+                    task,
+                    effective_task,
+                    a_note,
+                    b_note,
+                    search_results,
+                    args,
+                    heuristics_excerpt,
+                    current_priorities,
+                    sqlite_excerpt,
+                    search_iteration,
+                    revision_count_recent=sum(
+                        1 for item in revision_iterations if item > search_iteration - 3
+                    ),
+                    force_diagnostic_reason=force_diagnostic_reason if force_diagnostic_next_iteration else "",
+                )
+                c_decision = str(c_note.get("decision", "")).strip().upper()
+                revision_recent_count = sum(1 for item in revision_iterations if item > search_iteration - 3)
+                if c_decision == "RETURN_FOR_REVISION":
+                    max_revisions = max(0, int(getattr(args, "executive_max_revisions", 1)))
+                    if revision_recent_count >= max_revisions:
+                        c_note = dict(c_note)
+                        c_note["decision"] = "FORCE_DIAGNOSTIC"
+                        c_note["reason"] = (
+                            "Revision request rate-limited by the rolling 3-iteration window; forcing diagnostic instead."
+                        )
+                        c_note["acquisition_type"] = "FORCE_DIAGNOSTIC"
+                        c_decision = "FORCE_DIAGNOSTIC"
+                    else:
+                        revision_iterations.append(search_iteration)
+
+                if c_decision == "RETURN_FOR_REVISION":
+                    c_note = dict(c_note)
+                    c_note["acquisition_type"] = "WASTED_REJECT"
+                    c_note["priority_updates"] = normalize_text_list(c_note.get("priority_updates"), max_items=8)
+                    c_note["priority_updates"].append("Revision returned without execution; count as a wasted reject.")
+                    executive_log.append({"task": task, "decision": c_note})
+                    current_priorities = merge_priority_board(current_priorities, a_note, b_note, c_note)
+                    append_iteration_research(
+                        research_path,
+                        search_iteration,
+                        task,
+                        a_note,
+                        b_note,
+                        scientist_a_proposed_task=a_proposed_task,
+                        effective_task_after_policy=effective_task,
+                        scientist_b_reviewed_task=task,
+                        executive_note=c_note,
+                    )
+                    tried.add(task_key)
+                    append_research(
+                        research_path,
+                        f"- search_result_run: WASTED_REJECT at {utc_now_text()} for task={task}\n",
+                    )
+                    force_diagnostic_next_iteration = False
+                    force_diagnostic_reason = ""
+                    continue
+
+                if c_decision == "FORCE_DIAGNOSTIC":
+                    diag_idx, diag_note = physics_informed_select(
+                        search_tasks,
+                        tried,
+                        search_results,
+                        best_result=best_so_far,
+                        preferred_nc=task.get("nc"),
+                        preferred_seed_name=str(task.get("seed_name", "")),
+                        reason=str(c_note.get("reason", "")) or force_diagnostic_reason or "Arbitration forced a diagnostic task.",
+                    )
+                    selected_task = search_tasks[diag_idx]
+                    selected_key = (tuple(selected_task["nc"]), str(selected_task["seed_name"]))
+                    if selected_key in tried and selected_key != task_key:
+                        c_note["reason"] = "Diagnostic fallback landed on a tried task; keeping the original reject outcome."
+                        c_note["acquisition_type"] = "WASTED_REJECT"
+                        c_note["decision"] = "RETURN_FOR_REVISION"
+                        executive_log.append({"task": task, "decision": c_note})
+                        current_priorities = merge_priority_board(current_priorities, a_note, b_note, c_note)
+                        append_iteration_research(
+                            research_path,
+                            search_iteration,
+                            task,
+                            a_note,
+                            b_note,
+                            scientist_a_proposed_task=a_proposed_task,
+                            effective_task_after_policy=effective_task,
+                            scientist_b_reviewed_task=task,
+                            executive_note=c_note,
+                        )
+                        tried.add(task_key)
+                        append_research(
+                            research_path,
+                            f"- search_result_run: WASTED_REJECT at {utc_now_text()} for task={task}\n",
+                        )
+                        continue
+                    selected_effective_task = effective_search_task(
+                        args,
+                        selected_task,
+                        flow_override=selected_task.get("flow_override") if isinstance(selected_task.get("flow_override"), dict) else None,
+                    )
+                    c_note["selected_task"] = selected_task
+                    c_note["diagnostic_note"] = diag_note
+                    c_note["acquisition_type"] = "FORCE_DIAGNOSTIC"
+                elif c_decision == "IMPLEMENT_B_COUNTER":
+                    selected_task = build_task_from_counterproposal(task, counterproposal, effective_task=effective_task, mode="counterproposal")
+                    selected_key = (tuple(selected_task["nc"]), str(selected_task["seed_name"]))
+                    if selected_key in tried and selected_key != task_key:
+                        c_note["reason"] = "Chosen counterproposal task was already tried; switching to diagnostic fallback."
+                        diag_idx, diag_note = physics_informed_select(
+                            search_tasks,
+                            tried,
+                            search_results,
+                            best_result=best_so_far,
+                            preferred_nc=selected_task.get("nc"),
+                            preferred_seed_name=str(selected_task.get("seed_name", "")),
+                            reason=str(c_note.get("reason", "")),
+                        )
+                        selected_task = search_tasks[diag_idx]
+                        selected_key = (tuple(selected_task["nc"]), str(selected_task["seed_name"]))
+                        c_note["decision"] = "FORCE_DIAGNOSTIC"
+                        c_note["acquisition_type"] = "FORCE_DIAGNOSTIC"
+                        c_note["diagnostic_note"] = diag_note
+                    selected_effective_task = effective_search_task(
+                        args,
+                        selected_task,
+                        flow_override=selected_task.get("flow_override") if isinstance(selected_task.get("flow_override"), dict) else None,
+                    )
+                    c_note["selected_task"] = selected_task
+                elif c_decision == "IMPLEMENT_HYBRID":
+                    selected_task = build_task_from_counterproposal(task, counterproposal, effective_task=effective_task, mode="hybrid")
+                    selected_key = (tuple(selected_task["nc"]), str(selected_task["seed_name"]))
+                    if selected_key in tried and selected_key != task_key:
+                        c_note["reason"] = "Hybrid arbitration target was already tried; switching to diagnostic fallback."
+                        diag_idx, diag_note = physics_informed_select(
+                            search_tasks,
+                            tried,
+                            search_results,
+                            best_result=best_so_far,
+                            preferred_nc=selected_task.get("nc"),
+                            preferred_seed_name=str(selected_task.get("seed_name", "")),
+                            reason=str(c_note.get("reason", "")),
+                        )
+                        selected_task = search_tasks[diag_idx]
+                        selected_key = (tuple(selected_task["nc"]), str(selected_task["seed_name"]))
+                        c_note["decision"] = "FORCE_DIAGNOSTIC"
+                        c_note["acquisition_type"] = "FORCE_DIAGNOSTIC"
+                        c_note["diagnostic_note"] = diag_note
+                    selected_effective_task = effective_search_task(
+                        args,
+                        selected_task,
+                        flow_override=selected_task.get("flow_override") if isinstance(selected_task.get("flow_override"), dict) else None,
+                    )
+                    c_note["selected_task"] = selected_task
+                else:
+                    selected_task = task
+                    selected_key = task_key
+                    selected_effective_task = effective_task
+                    c_note["selected_task"] = selected_task
+
+                executive_note = c_note
+                executive_log.append({"task": task, "decision": executive_note})
+                current_priorities = merge_priority_board(current_priorities, a_note, b_note, executive_note)
+                append_iteration_research(
+                    research_path,
+                    search_iteration,
+                    task,
+                    a_note,
+                    b_note,
+                    scientist_a_proposed_task=a_proposed_task,
+                    effective_task_after_policy=effective_task,
+                    scientist_b_reviewed_task=task,
+                    executive_note=executive_note,
+                )
+                tried.add(task_key)
+                if selected_key != task_key:
+                    tried.add(selected_key)
+                execution_policy = search_execution_policy(args, search_tasks, search_results, selected_task)
+                if execution_policy.get("reason"):
+                    append_research(
+                        research_path,
+                        f"- execution_policy: {execution_policy.get('reason')}\n",
+                    )
+                progress_log(f"AGENT: execute search arbitration start task={selected_task}")
+                result = execute_search_task(
+                    args,
+                    selected_task,
+                    fidelity_override=(
+                        execution_policy.get("fidelity_override")
+                        if isinstance(execution_policy.get("fidelity_override"), dict)
+                        else None
+                    ),
+                    flow_override=selected_effective_task.get("flow") if isinstance(selected_effective_task.get("flow"), dict) else None,
+                    execution_note=str(execution_policy.get("reason", "")),
+                )
+                progress_log(
+                    "AGENT: execute search arbitration done "
+                    + f"run={result.get('run_name')} status={result.get('status')} "
+                    + f"wall_s={float(((result.get('timing') or {}).get('wall_seconds') or 0.0)):.1f}"
+                )
+                result["arbitration_decision"] = executive_note.get("decision")
+                result["arbitration_note"] = executive_note
+                search_results.append(result)
+                persist_result_to_sqlite(sqlite_conn, args.run_name, "search", result)
+                sim_counter += 1
+                acq_type = str(executive_note.get("acquisition_type", "")).strip().upper() or str(a_note.get("acquisition_type", "")).strip().upper()
+                record_convergence_snapshot(
+                    sqlite_conn,
+                    args.run_name,
+                    runtime_method,
+                    sim_counter,
+                    result,
+                    search_hours_used * 3600.0,
+                    search_hours_used,
+                    acquisition_type=acq_type,
+                )
+                heuristics_excerpt = build_heuristics_context(max_chars=900)
+                append_result_research(research_path, result, "search")
+                append_research(
+                    research_path,
+                    "\n#### Insights and Trends Update\n"
+                    f"- timestamp_utc: {utc_now_text()}\n"
+                    + sqlite_layout_trend_table(sqlite_conn)
+                    + "\n",
+                )
+                ledger.append(
+                    {
+                        "phase": "search_arbitrated",
+                        "run_name": result.get("run_name"),
+                        "status": result.get("status"),
+                        "timing": result.get("timing"),
+                    }
+                )
+                timing = result.get("timing") or {}
+                search_hours_used += float(timing.get("wall_seconds", 0.0)) / 3600.0
+                infeasibility_state = check_systematic_infeasibility(
+                    search_results,
+                    int(getattr(args, "systematic_infeasibility_k", 5)),
+                )
+                if bool(infeasibility_state.get("triggered")):
+                    force_diagnostic_next_iteration = True
+                    force_diagnostic_reason = str(infeasibility_state.get("reason", ""))
+                else:
+                    force_diagnostic_next_iteration = False
+                    force_diagnostic_reason = ""
+                continue
+
             executive_note = executive_controller_decide(
                 args,
                 search_tasks,
@@ -4154,7 +5209,7 @@ def main() -> int:
                 persist_result_to_sqlite(sqlite_conn, args.run_name, "search", result)
                 sim_counter += 1
                 record_convergence_snapshot(
-                    sqlite_conn, args.run_name, "agent", sim_counter, result,
+                    sqlite_conn, args.run_name, runtime_method, sim_counter, result,
                     search_hours_used * 3600.0, search_hours_used,
                     acquisition_type="FORCE_DIAGNOSTIC",
                 )
@@ -4176,6 +5231,13 @@ def main() -> int:
                 )
                 timing = result.get("timing") or {}
                 search_hours_used += float(timing.get("wall_seconds", 0.0)) / 3600.0
+                infeasibility_state = check_systematic_infeasibility(
+                    search_results,
+                    int(getattr(args, "systematic_infeasibility_k", 5)),
+                )
+                if bool(infeasibility_state.get("triggered")):
+                    force_diagnostic_next_iteration = True
+                    force_diagnostic_reason = str(infeasibility_state.get("reason", ""))
                 consecutive_rejects = 0
                 continue
 
@@ -4207,7 +5269,7 @@ def main() -> int:
             sim_counter += 1
             acq_type = str(a_note.get("acquisition_type", "")).strip().upper() if isinstance(a_note, dict) else ""
             record_convergence_snapshot(
-                sqlite_conn, args.run_name, "agent", sim_counter, result,
+                sqlite_conn, args.run_name, runtime_method, sim_counter, result,
                 search_hours_used * 3600.0, search_hours_used,
                 acquisition_type=acq_type,
             )
@@ -4231,6 +5293,13 @@ def main() -> int:
             )
             timing = result.get("timing") or {}
             search_hours_used += float(timing.get("wall_seconds", 0.0)) / 3600.0
+            infeasibility_state = check_systematic_infeasibility(
+                search_results,
+                int(getattr(args, "systematic_infeasibility_k", 5)),
+            )
+            if bool(infeasibility_state.get("triggered")):
+                force_diagnostic_next_iteration = True
+                force_diagnostic_reason = str(infeasibility_state.get("reason", ""))
 
         validation_pool, finalization_gate_notes = build_validation_candidates(args, search_results, args.max_validations)
         if finalization_gate_notes:
@@ -4283,6 +5352,7 @@ def main() -> int:
         payload = {
             "status": "ok",
             "run_name": args.run_name,
+            "method": runtime_method,
             "mode": (
                 "single-scientist"
                 if bool(int(args.single_scientist_mode))
@@ -4372,7 +5442,7 @@ def main() -> int:
             },
             "convergence": {
                 "total_simulations": sim_counter,
-                "method": "agent",
+                "method": runtime_method,
                 "summary": sqlite_convergence_context(sqlite_conn, args.run_name),
             },
             "research": {
