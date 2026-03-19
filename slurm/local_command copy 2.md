@@ -79,15 +79,18 @@ slurm/pace_smb_two_scientists_qwen.slurm
 
 
 ## Monitoring a running job
+After start, verify GPU really engaged:
+JOB=5078352
+grep -Ei "GPULayers|loaded CUDA backend|offloaded .* layers to GPU" logs/ollama-smb-${JOB}.log | tail -n 30
 
 ```bash
 # Live output/error
-tail -n 30 -f logs/smb-two-scientists-5077708.out 
+tail -n 30 -f logs/smb-two-scientists-5078352.out 
 tail -n 30 -f logs/smb-two-scientists-5077708.err
-tail -n 30 -f logs/ollama-smb-5077708.log 
+tail -n 30 -f logs/ollama-smb-5078352.log 
 
 # CPU/GPU monitor
-srun --jobid=5077708 --overlap bash -lc '
+srun --jobid=5078352 --overlap bash -lc '
 while true; do
   clear
   echo "=== $(date) ==="
@@ -99,6 +102,8 @@ done'
 
 ```
 
+
+
 ## Live conversation stream (while job is running)
 Live compact stream (scientist A/B/C only):
 JOB=5077708
@@ -107,7 +112,7 @@ tail -F "$FILE" | jq -r '[.call_id,.role,(.metadata.iteration//""),(.assistant_r
 
 ## Use this for live A + B + C full text:
 
-JOB=5077708
+JOB=5078352
 FILE=$(ls -t artifacts/agent_runs/*.conversations.jsonl 2>/dev/null | head -1); echo "$FILE"
 tail -F "$FILE" | jq -r 'select(.role|test("^scientist_(a_pick|b_review|c_arbitrate)$")) | "\n--- call=\(.call_id) role=\(.role) iter=\(.metadata.iteration // "") backend=\(.final_backend) ---\n\(.assistant_response // .assistant_response_preview // "")\n"'
 

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
 import signal
 import shutil
+import multiprocessing
 import subprocess
 import sys
 import threading
@@ -865,6 +867,118 @@ def _ensure_ipopt_logfile(solver_options: Dict[str, object], args: argparse.Name
     solver_options.setdefault("file_print_level", 5)
 
 
+def resolve_ipopt_parallel_profile(args: argparse.Namespace) -> Dict[str, int]:
+    cpu_budget = int(os.environ.get("SLURM_CPUS_PER_TASK", os.environ.get("SMB_CPU_TASKS", "1")))
+    workers = max(1, int(getattr(args, "ipopt_workers", 1) or 1))
+    threads_arg = int(getattr(args, "ipopt_threads_per_worker", 0) or 0)
+    if threads_arg > 0:
+        threads_per_worker = threads_arg
+    else:
+        threads_per_worker = max(1, cpu_budget // workers)
+    threads_per_worker = max(1, min(threads_per_worker, cpu_budget))
+    return {
+        "workers": workers,
+        "threads_per_worker": threads_per_worker,
+        "cpu_budget": cpu_budget,
+    }
+
+
+def ipopt_accounting_cpus(args: argparse.Namespace) -> int:
+    profile = resolve_ipopt_parallel_profile(args)
+    if int(getattr(args, "ipopt_threads_per_worker", 0) or 0) > 0:
+        return int(profile["threads_per_worker"])
+    return int(profile["cpu_budget"])
+
+
+def apply_worker_thread_env(threads_per_worker: int) -> None:
+    value = str(max(1, int(threads_per_worker)))
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[key] = value
+
+
+def _parallel_stage_worker_init(threads_per_worker: int) -> None:
+    apply_worker_thread_env(threads_per_worker)
+
+
+def _parallel_stage_worker(payload: Dict[str, object]) -> Dict[str, object]:
+    stage = str(payload.get("stage", "")).strip()
+    args_data = payload.get("args")
+    nc = payload.get("nc")
+    if not isinstance(args_data, dict):
+        return {
+            "status": "error",
+            "error": "missing_args_payload",
+            "traceback": "",
+        }
+    args = argparse.Namespace(**args_data)
+    if bool(payload.get("set_worker_env", True)):
+        apply_worker_thread_env(int(payload.get("threads_per_worker", 1) or 1))
+    try:
+        if stage == "candidate":
+            if not isinstance(nc, (list, tuple)):
+                raise ValueError("candidate payload missing nc")
+            return evaluate_candidate(args, tuple(int(v) for v in nc), return_model_state=bool(payload.get("return_model_state", False)))
+        if stage == "optimized":
+            if not isinstance(nc, (list, tuple)):
+                raise ValueError("optimized payload missing nc")
+            warm_start_state = payload.get("warm_start_state")
+            if warm_start_state is not None and not isinstance(warm_start_state, dict):
+                warm_start_state = None
+            return evaluate_optimized_layout(args, tuple(int(v) for v in nc), warm_start_state=warm_start_state)
+        raise ValueError(f"Unsupported parallel stage payload: {stage}")
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+            "stage": stage,
+            "run_name": getattr(args, "run_name", ""),
+            "nc": list(nc) if isinstance(nc, (list, tuple)) else [],
+        }
+
+
+def run_parallel_stage_tasks(
+    payloads: List[Dict[str, object]],
+    *,
+    workers: int,
+    threads_per_worker: int,
+) -> List[Dict[str, object]]:
+    if not payloads:
+        return []
+    if workers <= 1 or len(payloads) == 1:
+        serial_results: List[Dict[str, object]] = []
+        for payload in payloads:
+            serial_payload = dict(payload)
+            serial_payload["set_worker_env"] = False
+            serial_results.append(_parallel_stage_worker(serial_payload))
+        return serial_results
+
+    max_workers = min(max(1, workers), len(payloads))
+    results: List[Dict[str, object] | None] = [None] * len(payloads)
+    ctx = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=ctx,
+        initializer=_parallel_stage_worker_init,
+        initargs=(threads_per_worker,),
+    ) as executor:
+        future_to_index = {
+            executor.submit(_parallel_stage_worker, payload): idx
+            for idx, payload in enumerate(payloads)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            idx = future_to_index[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:
+                results[idx] = {
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc(),
+                }
+    return [item if isinstance(item, dict) else {"status": "error", "error": "missing_result"} for item in results]
+
+
 def evaluate_candidate(args: argparse.Namespace, nc: Sequence[int], *, return_model_state: bool = False) -> Dict[str, object]:
     from sembasmb import (  # type: ignore
         apply_discretization,
@@ -901,7 +1015,7 @@ def evaluate_candidate(args: argparse.Namespace, nc: Sequence[int], *, return_mo
     monitor_snapshot = monitor.snapshot() if monitor is not None else None
     end_wall = time.perf_counter()
     end_cpu = time.process_time()
-    cpus_used = int(os.environ.get("SLURM_CPUS_PER_TASK", os.environ.get("SMB_CPU_TASKS", "1")))
+    cpus_used = ipopt_accounting_cpus(args)
     wall_seconds = end_wall - start_wall
     cpu_seconds = end_cpu - start_cpu
     if solve_exc is not None:
@@ -1165,7 +1279,7 @@ def evaluate_optimized_layout(
     monitor_snapshot = monitor.snapshot() if monitor is not None else None
     end_wall = time.perf_counter()
     end_cpu = time.process_time()
-    cpus_used = int(os.environ.get("SLURM_CPUS_PER_TASK", os.environ.get("SMB_CPU_TASKS", "1")))
+    cpus_used = ipopt_accounting_cpus(args)
     wall_seconds = end_wall - start_wall
     cpu_seconds = end_cpu - start_cpu
 
@@ -1453,23 +1567,24 @@ def rank_results(results: List[Dict[str, object]]) -> List[Dict[str, object]]:
 
 def run_nc_screen(args: argparse.Namespace) -> Dict[str, object]:
     nc_library = parse_nc_library(args.nc_library)
-    results: List[Dict[str, object]] = []
+    profile = resolve_ipopt_parallel_profile(args)
+    payloads: List[Dict[str, object]] = []
     for nc in nc_library:
         candidate_args = argparse.Namespace(**vars(args))
         candidate_args.run_name = f"{args.run_name}_nc_{'-'.join(str(v) for v in nc)}"
-        try:
-            results.append(evaluate_candidate(candidate_args, nc))
-        except Exception as exc:
-            results.append(
-                {
-                    "status": "error",
-                    "stage": args.stage,
-                    "run_name": candidate_args.run_name,
-                    "nc": list(nc),
-                    "error": str(exc),
-                    "traceback": traceback.format_exc(),
-                }
-            )
+        payloads.append(
+            {
+                "stage": "candidate",
+                "args": dict(vars(candidate_args)),
+                "nc": list(nc),
+                "threads_per_worker": profile["threads_per_worker"],
+            }
+        )
+    results = run_parallel_stage_tasks(
+        payloads,
+        workers=profile["workers"],
+        threads_per_worker=profile["threads_per_worker"],
+    )
     successful = [item for item in results if item.get("status") == "ok"]
     ranked = rank_results(successful) if successful else []
     return {
@@ -1484,6 +1599,7 @@ def run_nc_screen(args: argparse.Namespace) -> Dict[str, object]:
 
 def run_flow_screen(args: argparse.Namespace) -> Dict[str, object]:
     nc = parse_nc(args.nc)
+    profile = resolve_ipopt_parallel_profile(args)
     flow_grid = {
         "ffeed": parse_float_library(args.ffeed_library),
         "f1": parse_float_library(args.f1_library),
@@ -1491,7 +1607,7 @@ def run_flow_screen(args: argparse.Namespace) -> Dict[str, object]:
         "fex": parse_float_library(args.fex_library),
         "tstep": parse_float_library(args.tstep_library),
     }
-    results: List[Dict[str, object]] = []
+    payloads: List[Dict[str, object]] = []
 
     for idx, (ffeed, f1, fdes, fex, tstep) in enumerate(
         product(
@@ -1514,27 +1630,20 @@ def run_flow_screen(args: argparse.Namespace) -> Dict[str, object]:
             f"{args.run_name}_pt_{idx:03d}"
             f"_ffeed_{ffeed:g}_f1_{f1:g}_fdes_{fdes:g}_fex_{fex:g}_t_{tstep:g}"
         )
-        try:
-            results.append(evaluate_candidate(candidate_args, nc))
-        except Exception as exc:
-            results.append(
-                {
-                    "status": "error",
-                    "stage": args.stage,
-                    "run_name": candidate_args.run_name,
-                    "nc": list(nc),
-                    "flow": {
-                        "Ffeed": ffeed,
-                        "F1": f1,
-                        "Fdes": fdes,
-                        "Fex": fex,
-                        "Fraf": candidate_args.fraf,
-                        "tstep": tstep,
-                    },
-                    "error": str(exc),
-                    "traceback": traceback.format_exc(),
-                }
-            )
+        payloads.append(
+            {
+                "stage": "candidate",
+                "args": dict(vars(candidate_args)),
+                "nc": list(nc),
+                "threads_per_worker": profile["threads_per_worker"],
+            }
+        )
+
+    results = run_parallel_stage_tasks(
+        payloads,
+        workers=profile["workers"],
+        threads_per_worker=profile["threads_per_worker"],
+    )
 
     successful = [item for item in results if item.get("status") == "ok"]
     ranked = rank_results(successful) if successful else []
@@ -1581,6 +1690,7 @@ def _pick_best_reference_state(
 
 def run_optimize_layouts(args: argparse.Namespace) -> Dict[str, object]:
     nc_library = parse_nc_library(args.nc_library)
+    profile = resolve_ipopt_parallel_profile(args)
     tstep_bounds = parse_bounds(args.tstep_bounds)
     ffeed_bounds = parse_bounds(args.ffeed_bounds)
     fdes_bounds = parse_bounds(args.fdes_bounds)
@@ -1605,16 +1715,14 @@ def run_optimize_layouts(args: argparse.Namespace) -> Dict[str, object]:
     ref_gate_max_seeds = int(os.environ.get("SMB_REFERENCE_GATE_MAX_SEEDS", "3"))
 
     for nc in nc_library:
-        # --- Reference-eval gate: run fixed-flow solves first to find a good
-        # warm-start point for optimization.  This is much cheaper than a full
-        # optimization run and gives IPOPT a physically reasonable starting
-        # point instead of the cold default initial guess.
         warm_start_state: Dict[str, object] | None = None
         ref_gate_results: List[Dict[str, object]] = []
         best_ref_seed_name: str | None = None
 
         if run_ref_gate:
             ref_seeds = seed_library[:ref_gate_max_seeds]
+            ref_payloads: List[Dict[str, object]] = []
+            ref_seed_args: List[argparse.Namespace] = []
             for seed in ref_seeds:
                 ref_args = apply_seed_to_args(
                     args,
@@ -1627,24 +1735,35 @@ def run_optimize_layouts(args: argparse.Namespace) -> Dict[str, object]:
                     f1_bounds=f1_bounds,
                 )
                 ref_args.run_name = f"{args.run_name}_refgate_nc_{'-'.join(str(v) for v in nc)}_{ref_args.seed_name}"
-                try:
-                    ref_result = evaluate_candidate(ref_args, nc, return_model_state=True)
-                    ref_gate_results.append(ref_result)
-                except Exception:
-                    pass  # Reference gate failure is non-fatal
+                ref_seed_args.append(ref_args)
+                ref_payloads.append(
+                    {
+                        "stage": "candidate",
+                        "args": dict(vars(ref_args)),
+                        "nc": list(nc),
+                        "return_model_state": True,
+                        "threads_per_worker": profile["threads_per_worker"],
+                    }
+                )
 
-                # Count reference evals in convergence tracking too
+            ref_gate_results = run_parallel_stage_tasks(
+                ref_payloads,
+                workers=profile["workers"],
+                threads_per_worker=profile["threads_per_worker"],
+            )
+
+            for ref_args, ref_result in zip(ref_seed_args, ref_gate_results):
                 sim_number += 1
-                timing = ref_result.get("timing") or {} if ref_gate_results else {}
+                timing = ref_result.get("timing") or {}
                 cumulative_wall_s += float(timing.get("wall_seconds", 0.0) if isinstance(timing, dict) else 0.0)
-                if ref_gate_results and ref_gate_results[-1].get("feasible"):
-                    j_val = ref_gate_results[-1].get("J_validated")
+                if ref_result.get("feasible"):
+                    j_val = ref_result.get("J_validated")
                     if j_val is not None:
                         j_float = float(j_val)
                         if best_feasible_j is None or j_float > best_feasible_j:
                             best_feasible_j = j_float
-                            best_feasible_run = str(ref_gate_results[-1].get("run_name", ""))
-                            ref_metrics = ref_gate_results[-1].get("metrics") or {}
+                            best_feasible_run = str(ref_result.get("run_name", ""))
+                            ref_metrics = ref_result.get("metrics") or {}
                             if isinstance(ref_metrics, dict):
                                 best_feasible_prod = float(ref_metrics.get("productivity_ex_ga_ma", 0.0))
                 convergence_log.append({
@@ -1655,21 +1774,21 @@ def run_optimize_layouts(args: argparse.Namespace) -> Dict[str, object]:
                     "best_feasible_run_name": best_feasible_run,
                     "cumulative_wall_seconds": cumulative_wall_s,
                     "nc": list(nc),
-                    "seed_name": str(seed.get("name", "")),
-                    "status": str(ref_gate_results[-1].get("status", "error")) if ref_gate_results else "error",
-                    "feasible": bool(ref_gate_results[-1].get("feasible")) if ref_gate_results else False,
+                    "seed_name": str(ref_args.seed_name),
+                    "status": str(ref_result.get("status", "error")),
+                    "feasible": bool(ref_result.get("feasible")),
                     "phase": "reference_gate",
                 })
 
             warm_start_state = _pick_best_reference_state(ref_gate_results)
             if warm_start_state is not None:
-                # Find which seed produced the best state
                 for rr in ref_gate_results:
                     if rr.get("_model_state") is warm_start_state:
                         best_ref_seed_name = str(rr.get("run_name", ""))
                         break
 
-        # --- Optimization runs: use warm-start from best reference eval
+        opt_seed_args: List[argparse.Namespace] = []
+        opt_payloads: List[Dict[str, object]] = []
         for seed in seed_library:
             candidate_args = apply_seed_to_args(
                 args,
@@ -1682,27 +1801,27 @@ def run_optimize_layouts(args: argparse.Namespace) -> Dict[str, object]:
                 f1_bounds=f1_bounds,
             )
             candidate_args.run_name = f"{args.run_name}_nc_{'-'.join(str(v) for v in nc)}_{candidate_args.seed_name}"
-            try:
-                result = evaluate_optimized_layout(
-                    candidate_args, nc, warm_start_state=warm_start_state,
-                )
-                if best_ref_seed_name is not None:
-                    result["warm_start_source"] = best_ref_seed_name
-                results.append(result)
-            except Exception as exc:
-                result = {
-                    "status": "error",
-                    "stage": args.stage,
-                    "run_name": candidate_args.run_name,
+            opt_seed_args.append(candidate_args)
+            opt_payloads.append(
+                {
+                    "stage": "optimized",
+                    "args": dict(vars(candidate_args)),
                     "nc": list(nc),
-                    "seed_name": candidate_args.seed_name,
-                    "seed_flow_original": candidate_args.seed_flow_original,
-                    "error": str(exc),
-                    "traceback": traceback.format_exc(),
+                    "warm_start_state": warm_start_state,
+                    "threads_per_worker": profile["threads_per_worker"],
                 }
-                results.append(result)
+            )
 
-            # Track convergence
+        opt_results = run_parallel_stage_tasks(
+            opt_payloads,
+            workers=profile["workers"],
+            threads_per_worker=profile["threads_per_worker"],
+        )
+        for candidate_args, result in zip(opt_seed_args, opt_results):
+            if best_ref_seed_name is not None and result.get("status") != "error":
+                result["warm_start_source"] = best_ref_seed_name
+            results.append(result)
+
             sim_number += 1
             timing = result.get("timing") or {}
             cumulative_wall_s += float(timing.get("wall_seconds", 0.0) if isinstance(timing, dict) else 0.0)
@@ -1718,13 +1837,13 @@ def run_optimize_layouts(args: argparse.Namespace) -> Dict[str, object]:
                             best_feasible_prod = float(metrics.get("productivity_ex_ga_ma", 0.0))
             convergence_log.append({
                 "sim_number": sim_number,
-                "candidate_run_name": str(result.get("run_name", "")),
+                "candidate_run_name": str(candidate_args.run_name),
                 "best_feasible_j": best_feasible_j,
                 "best_feasible_productivity": best_feasible_prod,
                 "best_feasible_run_name": best_feasible_run,
                 "cumulative_wall_seconds": cumulative_wall_s,
                 "nc": list(nc),
-                "seed_name": str(seed.get("name", "")),
+                "seed_name": str(candidate_args.seed_name),
                 "status": str(result.get("status", "")),
                 "feasible": bool(result.get("feasible")),
                 "phase": "optimization",
@@ -1787,6 +1906,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ipopt-monitor-dir",
         default=os.environ.get("SMB_IPOPT_MONITOR_DIR", str(REPO_ROOT / "artifacts" / "ipopt_live")),
+    )
+    parser.add_argument(
+        "--ipopt-workers",
+        type=int,
+        default=int(os.environ.get("SMB_IPOPT_WORKERS", "1")),
+    )
+    parser.add_argument(
+        "--ipopt-threads-per-worker",
+        type=int,
+        default=int(os.environ.get("SMB_IPOPT_THREADS_PER_WORKER", "0")),
     )
     parser.add_argument(
         "--executive-watchdog-enabled",
