@@ -470,7 +470,7 @@ start_local_qwen() {
   prompt_payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"ping"}],"stream":false}' "${OLLAMA_MODEL}")
   response_file="$(mktemp)"
   http_code="$(curl -sS \
-    --max-time 60 \
+    --max-time 600 \
     -o "${response_file}" \
     -w '%{http_code}' \
     -H "Content-Type: application/json" \
