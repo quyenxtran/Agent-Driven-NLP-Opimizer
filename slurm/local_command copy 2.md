@@ -3,7 +3,7 @@
 ```bash
 # Local: commit and push
 git add .
-git commit -m "Clean up codebase"
+git commit -m "update 3-4 reference per NC before evaluation"
 git push origin main
 
 # On PACE
@@ -362,12 +362,12 @@ grep -Ei "GPULayers|loaded CUDA backend|offloaded .* layers to GPU" logs/ollama-
 
 ```bash
 # Live output/error
-tail -n 30 -f logs/smb-two-scientists-5130685.out 
+tail -n 30 -f logs/smb-two-scientists-5138606.out 
 tail -n 30 -f logs/smb-two-scientists-5079126.err
 tail -n 30 -f logs/ollama-smb-5130343.log 
 
 # CPU/GPU monitor
-srun --jobid=5130021 --overlap bash -lc '
+srun --jobid=5138606 --overlap bash -lc '
 while true; do
   clear
   echo "=== $(date) ==="
@@ -381,7 +381,7 @@ while true; do
 done'
 
 ```
-JOB=5090778
+JOB=5138606
 srun --jobid=$JOB --overlap bash -lc 'echo workers=$SMB_IPOPT_WORKERS threads=$SMB_IPOPT_THREADS_PER_WORKER cpus=$SLURM_CPUS_PER_TASK; pgrep -af ipopt'
 
 
@@ -394,7 +394,7 @@ tail -F "$FILE" | jq -r '[.call_id,.role,(.metadata.iteration//""),(.assistant_r
 
 ## Use this for live A + B + C full text:
 
-JOB=5130685
+JOB=5138606
 FILE=$(ls -t artifacts/agent_runs/agent-runner.${JOB}.*.conversations.jsonl 2>/dev/null | head -1)
 LIVE=$(ls -t artifacts/agent_runs/live_results_*.jsonl 2>/dev/null | head -1)
 

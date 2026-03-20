@@ -821,6 +821,32 @@ def execute_search_task(
     flow_override: Optional[Dict[str, float]] = None,
     execution_note: str = "",
 ) -> Dict[str, object]:
+    candidate_args = build_search_candidate_args(
+        args,
+        task,
+        fidelity_override=fidelity_override,
+        solver_override=solver_override,
+        flow_override=flow_override,
+    )
+    result = rs.evaluate_optimized_layout(candidate_args, tuple(task["nc"]))
+    if isinstance(fidelity_override, dict) or isinstance(solver_override, dict) or isinstance(flow_override, dict) or execution_note:
+        result["execution_policy"] = {
+            "fidelity_override": fidelity_override or {},
+            "solver_override": solver_override or {},
+            "flow_override": flow_override or {},
+            "note": execution_note,
+        }
+    return result
+
+
+def build_search_candidate_args(
+    args: argparse.Namespace,
+    task: Dict[str, object],
+    *,
+    fidelity_override: Optional[Dict[str, int]] = None,
+    solver_override: Optional[Dict[str, object]] = None,
+    flow_override: Optional[Dict[str, float]] = None,
+) -> argparse.Namespace:
     base = configure_stage_args(make_stage_args("optimize-layouts"), args)
     tstep_bounds = rs.parse_bounds(base.tstep_bounds)
     ffeed_bounds = rs.parse_bounds(base.ffeed_bounds)
@@ -851,6 +877,10 @@ def execute_search_task(
             candidate_args.acceptable_tol = float(
                 solver_override.get("acceptable_tol", candidate_args.acceptable_tol)
             )
+        if "max_solve_seconds" in solver_override and solver_override.get("max_solve_seconds") is not None:
+            candidate_args.max_solve_seconds = float(
+                solver_override.get("max_solve_seconds", getattr(candidate_args, "max_solve_seconds", 0.0))
+            )
     if isinstance(flow_override, dict):
         flow_map = {
             "Ffeed": "ffeed",
@@ -866,15 +896,56 @@ def execute_search_task(
                 continue
             setattr(candidate_args, attr, float(value))
     candidate_args.run_name = f"{args.run_name}_search_nc_{'-'.join(str(v) for v in task['nc'])}_{candidate_args.seed_name}"
-    result = rs.evaluate_optimized_layout(candidate_args, tuple(task["nc"]))
-    if isinstance(fidelity_override, dict) or isinstance(solver_override, dict) or isinstance(flow_override, dict) or execution_note:
+    return candidate_args
+
+
+def execute_search_task_batch(
+    args: argparse.Namespace,
+    tasks: List[Dict[str, object]],
+    *,
+    fidelity_override: Optional[Dict[str, int]] = None,
+    solver_override: Optional[Dict[str, object]] = None,
+    execution_note: str = "",
+) -> List[Dict[str, object]]:
+    if not tasks:
+        return []
+    profile = rs.resolve_ipopt_parallel_profile(args)
+    payloads: List[Dict[str, object]] = []
+    for task in tasks:
+        flow_override = task.get("flow_override") if isinstance(task.get("flow_override"), dict) else None
+        candidate_args = build_search_candidate_args(
+            args,
+            task,
+            fidelity_override=fidelity_override,
+            solver_override=solver_override,
+            flow_override=flow_override,
+        )
+        payloads.append(
+            {
+                "stage": "optimized",
+                "args": dict(vars(candidate_args)),
+                "nc": list(task["nc"]),
+                "threads_per_worker": int(profile["threads_per_worker"]),
+            }
+        )
+    results = rs.run_parallel_stage_tasks(
+        payloads,
+        workers=int(profile["workers"]),
+        threads_per_worker=int(profile["threads_per_worker"]),
+    )
+    batch_size = len(results)
+    for batch_index, result in enumerate(results):
         result["execution_policy"] = {
             "fidelity_override": fidelity_override or {},
             "solver_override": solver_override or {},
-            "flow_override": flow_override or {},
+            "flow_override": {},
             "note": execution_note,
+            "batch_index": batch_index,
+            "batch_size": batch_size,
+            "parallel_workers": int(profile["workers"]),
+            "threads_per_worker": int(profile["threads_per_worker"]),
         }
-    return result
+    return results
 
 
 def effective_search_task(
@@ -1169,6 +1240,7 @@ apply_probe_reference_gate = split_policy.apply_probe_reference_gate
 probe_reference_runs_required = split_policy.probe_reference_runs_required
 search_execution_policy = split_policy.search_execution_policy
 near_feasible_continuation_select = split_policy.near_feasible_continuation_select
+screening_bundle_indices = split_policy.screening_bundle_indices
 deterministic_review = split_policy.deterministic_review
 single_scientist_policy_review = split_policy.single_scientist_policy_review
 executive_controller_decide = split_policy.executive_controller_decide
@@ -1421,6 +1493,63 @@ def main() -> int:
         validation_hours_used = 0.0
         search_iteration = 0
         consecutive_rejects = 0
+
+        def record_search_execution(
+            phase: str,
+            tasks_executed: List[Dict[str, object]],
+            results_executed: List[Dict[str, object]],
+            *,
+            iteration: int,
+            acquisition_type: str,
+            arbitration_outcome: str,
+        ) -> None:
+            nonlocal sim_counter, search_hours_used, heuristics_excerpt
+            batch_size = len(results_executed)
+            for batch_index, (executed_task, result) in enumerate(zip(tasks_executed, results_executed), start=1):
+                if batch_size > 1:
+                    result["batch_index"] = batch_index
+                    result["batch_size"] = batch_size
+                emit_live_event(
+                    "simulation_complete",
+                    iteration=iteration,
+                    role="simulation",
+                    task=executed_task,
+                    result=result,
+                    acquisition_type=acquisition_type,
+                    arbitration_outcome=arbitration_outcome,
+                )
+                search_results.append(result)
+                persist_result_to_sqlite(sqlite_conn, args.run_name, "search", result)
+                sim_counter += 1
+                record_convergence_snapshot(
+                    sqlite_conn,
+                    args.run_name,
+                    runtime_method,
+                    sim_counter,
+                    result,
+                    search_hours_used * 3600.0,
+                    search_hours_used,
+                    acquisition_type=acquisition_type,
+                )
+                append_result_research(research_path, result, "search")
+                ledger.append(
+                    {
+                        "phase": phase,
+                        "run_name": result.get("run_name"),
+                        "status": result.get("status"),
+                        "timing": result.get("timing"),
+                    }
+                )
+                timing = result.get("timing") or {}
+                search_hours_used += float(timing.get("wall_seconds", 0.0)) / 3600.0
+            heuristics_excerpt = build_heuristics_context(max_chars=900)
+            append_research(
+                research_path,
+                "\n#### Insights and Trends Update\n"
+                f"- timestamp_utc: {utc_now_text()}\n"
+                + sqlite_layout_trend_table(sqlite_conn)
+                + "\n",
+            )
 
         while (
             len(tried) < len(search_tasks)
@@ -2422,72 +2551,77 @@ def main() -> int:
                 consecutive_rejects = 0
                 continue
 
-            tried.add(task_key)
             execution_policy = search_execution_policy(args, search_tasks, search_results, task)
             if execution_policy.get("reason"):
                 append_research(
                     research_path,
                     f"- execution_policy: {execution_policy.get('reason')}\n",
                 )
-            progress_log(f"AGENT: execute search start task={task}")
-            result = execute_search_task(
-                args,
-                task,
-                fidelity_override=(
-                    execution_policy.get("fidelity_override")
-                    if isinstance(execution_policy.get("fidelity_override"), dict)
-                    else None
-                ),
-                solver_override=(
-                    execution_policy.get("solver_override")
-                    if isinstance(execution_policy.get("solver_override"), dict)
-                    else None
-                ),
-                execution_note=str(execution_policy.get("reason", "")),
-            )
-            progress_log(
-                "AGENT: execute search done "
-                + f"run={result.get('run_name')} status={result.get('status')} "
-                + f"wall_s={float(((result.get('timing') or {}).get('wall_seconds') or 0.0)):.1f}"
-            )
-            emit_live_event(
-                "simulation_complete",
-                iteration=search_iteration,
-                role="simulation",
-                task=task,
-                result=result,
-                acquisition_type=str(a_note.get("acquisition_type", "")).strip().upper(),
-                arbitration_outcome="DIRECT_EXECUTION",
-            )
-            search_results.append(result)
-            persist_result_to_sqlite(sqlite_conn, args.run_name, "search", result)
-            sim_counter += 1
             acq_type = str(a_note.get("acquisition_type", "")).strip().upper() if isinstance(a_note, dict) else ""
-            record_convergence_snapshot(
-                sqlite_conn, args.run_name, runtime_method, sim_counter, result,
-                search_hours_used * 3600.0, search_hours_used,
-                acquisition_type=acq_type,
+            fidelity_override = (
+                execution_policy.get("fidelity_override")
+                if isinstance(execution_policy.get("fidelity_override"), dict)
+                else None
             )
-            # Refresh heuristics after each run so next proposal uses updated knowledge
-            heuristics_excerpt = build_heuristics_context(max_chars=900)
-            append_result_research(research_path, result, "search")
-            append_research(
-                research_path,
-                "\n#### Insights and Trends Update\n"
-                f"- timestamp_utc: {utc_now_text()}\n"
-                + sqlite_layout_trend_table(sqlite_conn)
-                + "\n",
+            solver_override = (
+                execution_policy.get("solver_override")
+                if isinstance(execution_policy.get("solver_override"), dict)
+                else None
             )
-            ledger.append(
-                {
-                    "phase": "search",
-                    "run_name": result.get("run_name"),
-                    "status": result.get("status"),
-                    "timing": result.get("timing"),
-                }
-            )
-            timing = result.get("timing") or {}
-            search_hours_used += float(timing.get("wall_seconds", 0.0)) / 3600.0
+            bundle_indices = screening_bundle_indices(args, search_tasks, tried, search_results, idx)
+            if len(bundle_indices) > 1:
+                tasks_to_execute = [search_tasks[bundle_idx] for bundle_idx in bundle_indices]
+                for bundle_task in tasks_to_execute:
+                    tried.add((tuple(bundle_task["nc"]), str(bundle_task["seed_name"])))
+                progress_log(
+                    "AGENT: execute screening bundle start "
+                    + f"nc={list(task['nc'])} count={len(tasks_to_execute)}"
+                )
+                results = execute_search_task_batch(
+                    args,
+                    tasks_to_execute,
+                    fidelity_override=fidelity_override,
+                    solver_override=solver_override,
+                    execution_note=str(execution_policy.get("reason", "")),
+                )
+                for executed_task, result in zip(tasks_to_execute, results):
+                    progress_log(
+                        "AGENT: execute screening bundle done "
+                        + f"run={result.get('run_name')} status={result.get('status')} "
+                        + f"wall_s={float(((result.get('timing') or {}).get('wall_seconds') or 0.0)):.1f}"
+                    )
+                    result["screening_bundle"] = True
+                record_search_execution(
+                    "search_screening_bundle",
+                    tasks_to_execute,
+                    results,
+                    iteration=search_iteration,
+                    acquisition_type=acq_type,
+                    arbitration_outcome="DIRECT_EXECUTION",
+                )
+            else:
+                tried.add(task_key)
+                progress_log(f"AGENT: execute search start task={task}")
+                result = execute_search_task(
+                    args,
+                    task,
+                    fidelity_override=fidelity_override,
+                    solver_override=solver_override,
+                    execution_note=str(execution_policy.get("reason", "")),
+                )
+                progress_log(
+                    "AGENT: execute search done "
+                    + f"run={result.get('run_name')} status={result.get('status')} "
+                    + f"wall_s={float(((result.get('timing') or {}).get('wall_seconds') or 0.0)):.1f}"
+                )
+                record_search_execution(
+                    "search",
+                    [task],
+                    [result],
+                    iteration=search_iteration,
+                    acquisition_type=acq_type,
+                    arbitration_outcome="DIRECT_EXECUTION",
+                )
             infeasibility_state = check_systematic_infeasibility(
                 search_results,
                 int(getattr(args, "systematic_infeasibility_k", 5)),

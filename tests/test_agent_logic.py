@@ -282,6 +282,19 @@ def test_near_feasible_continuation_prefers_same_nc_before_topology_hop() -> Non
     assert note["anchor_nc"] == [2, 2, 2, 2]
 
 
+def test_screening_bundle_indices_collects_remaining_same_nc_runs() -> None:
+    args = make_args(screening_runs_per_nc=3, screening_runs_min_per_nc=3, screening_runs_max_per_nc=3)
+    tasks = [
+        {"nc": [2, 2, 2, 2], "seed_name": "reference", "seed": {"name": "reference"}, "screening_seed": True, "screening_rank": 0},
+        {"nc": [1, 3, 2, 2], "seed_name": "reference", "seed": {"name": "reference"}, "screening_seed": True, "screening_rank": 0},
+        {"nc": [2, 2, 2, 2], "seed_name": "optimized_a_minus", "seed": {"name": "optimized_a_minus"}, "screening_seed": True, "screening_rank": 1},
+        {"nc": [2, 2, 2, 2], "seed_name": "optimized_c", "seed": {"name": "optimized_c"}, "screening_seed": True, "screening_rank": 2},
+        {"nc": [1, 3, 2, 2], "seed_name": "optimized_a_minus", "seed": {"name": "optimized_a_minus"}, "screening_seed": True, "screening_rank": 1},
+    ]
+    bundle = ar.screening_bundle_indices(args, tasks, tried=set(), search_results=[], selected_idx=0)
+    assert bundle == [0, 2, 3]
+
+
 def test_check_systematic_infeasibility_not_triggered_for_near_feasible_boundary_window() -> None:
     results = [
         sample_result("run_1", feasible=False, status="solver_error", j=None, productivity=0.0061, purity=0.5999, rga=0.75, rma=0.75, violation=8e-7),
@@ -298,6 +311,7 @@ def test_search_execution_policy_applies_relaxed_solver_override_for_screening_p
     monkeypatch.setenv("SMB_SCREENING_IPOPT_MAX_ITER", "777")
     monkeypatch.setenv("SMB_SCREENING_IPOPT_TOL", "0.0002")
     monkeypatch.setenv("SMB_SCREENING_IPOPT_ACCEPTABLE_TOL", "0.002")
+    monkeypatch.setenv("SMB_SCREENING_IPOPT_MAX_SOLVE_SECONDS", "180")
     args = make_args(screening_runs_per_nc=2, screening_runs_min_per_nc=2, screening_runs_max_per_nc=2)
     tasks = [
         {"nc": [2, 2, 2, 2], "seed_name": "reference", "seed": {"name": "reference"}, "screening_seed": True},
@@ -309,6 +323,7 @@ def test_search_execution_policy_applies_relaxed_solver_override_for_screening_p
     assert policy["solver_override"]["max_iter"] == 777
     assert abs(policy["solver_override"]["tol"] - 0.0002) < 1e-12
     assert abs(policy["solver_override"]["acceptable_tol"] - 0.002) < 1e-12
+    assert abs(policy["solver_override"]["max_solve_seconds"] - 180.0) < 1e-12
 
 
 def test_request_json_with_single_repair_requests_json_mode() -> None:

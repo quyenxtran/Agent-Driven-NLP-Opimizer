@@ -2,21 +2,21 @@
 # Two-scientist SMB optimization job for the local SembaSMB reference model.
 #
 # Suggested submissions:
-# sbatch AutoResearch-SMB/slurm/pace_smb_two_scientists_qwen.slurm
-# sbatch --export=ALL,START_LOCAL_LLM=1 AutoResearch-SMB/slurm/pace_smb_two_scientists_qwen.slurm
-# sbatch --export=ALL,START_LOCAL_LLM=1,RUN_BASELINE_NOTEBOOK=1 AutoResearch-SMB/slurm/pace_smb_two_scientists_qwen.slurm
-# sbatch --export=ALL,START_LOCAL_LLM=1,AGENT_ENTRYPOINT="python -m benchmarks.agent_runner" AutoResearch-SMB/slurm/pace_smb_two_scientists_qwen.slurm
+# sbatch AutoResearch-SMB/slurm/pace_smb_two_scientists_gpt.slurm
+# sbatch --export=ALL,START_LOCAL_LLM=0 AutoResearch-SMB/slurm/pace_smb_two_scientists_gpt.slurm
+# sbatch --export=ALL,START_LOCAL_LLM=0,RUN_BASELINE_NOTEBOOK=1 AutoResearch-SMB/slurm/pace_smb_two_scientists_gpt.slurm
+# sbatch --export=ALL,START_LOCAL_LLM=0,AGENT_ENTRYPOINT="python -m benchmarks.agent_runner" AutoResearch-SMB/slurm/pace_smb_two_scientists_gpt.slurm
 #
 # This file is based on the existing PACE sample Slurm file, but it is narrowed to the
 # SembaSMB optimization workflow and exports an explicit compute budget so the two
 # scientists can plan around the real resources of the job.
 
-#SBATCH --job-name=smb-two-scientists
+#SBATCH --job-name=smb-two-scientists-gpt
 #SBATCH -A gts-sn73
 #SBATCH --qos=inferno
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=6
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
 #SBATCH --mail-user=qtran47@gatech.edu
@@ -153,29 +153,29 @@ fi
 if [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
   SMB_GPU_COUNT_COMPUTED="${SLURM_GPUS_ON_NODE}"
 else
-  SMB_GPU_COUNT_COMPUTED="1"
+  SMB_GPU_COUNT_COMPUTED="0"
 fi
 
-export SMB_EXPERIMENT_NAME="${SMB_EXPERIMENT_NAME:-qwen_smb_two_scientists}"
+export SMB_EXPERIMENT_NAME="${SMB_EXPERIMENT_NAME:-gpt_smb_two_scientists}"
 export SMB_AGENT_COUNT="${SMB_AGENT_COUNT:-2}"
 export SMB_AGENT_1_NAME="${SMB_AGENT_1_NAME:-Scientist_A}"
 export SMB_AGENT_1_ROLE="${SMB_AGENT_1_ROLE:-process_optimization_scientist}"
 export SMB_AGENT_2_NAME="${SMB_AGENT_2_NAME:-Scientist_B}"
 export SMB_AGENT_2_ROLE="${SMB_AGENT_2_ROLE:-skeptical_process_and_numerics_scientist}"
-export SMB_LOCAL_LLM_MODEL="${SMB_LOCAL_LLM_MODEL:-qwen3.5:9b}"
-export SMB_EXECUTIVE_LLM_MODEL="${SMB_EXECUTIVE_LLM_MODEL:-deepseek-r1:7b}"
-export SMB_CPU_TASKS="${SMB_CPU_TASKS:-${SLURM_CPUS_PER_TASK:-6}}"
-export SMB_IPOPT_WORKERS="${SMB_IPOPT_WORKERS:-2}"
-export SMB_IPOPT_THREADS_PER_WORKER="${SMB_IPOPT_THREADS_PER_WORKER:-2}"
+export SMB_LOCAL_LLM_MODEL="${SMB_LOCAL_LLM_MODEL:-gpt-5.4-mini}"
+export SMB_EXECUTIVE_LLM_MODEL="${SMB_EXECUTIVE_LLM_MODEL:-gpt-5.4-mini}"
+export SMB_CPU_TASKS="${SMB_CPU_TASKS:-${SLURM_CPUS_PER_TASK:-8}}"
+export SMB_IPOPT_WORKERS="${SMB_IPOPT_WORKERS:-4}"
+export SMB_IPOPT_THREADS_PER_WORKER="${SMB_IPOPT_THREADS_PER_WORKER:-1}"
 export SMB_GPU_COUNT="${SMB_GPU_COUNT:-${SMB_GPU_COUNT_COMPUTED}}"
-export SMB_GPU_MODEL="${SMB_GPU_MODEL:-rtx_6000}"
+export SMB_GPU_MODEL="${SMB_GPU_MODEL:-none}"
 export SMB_MEMORY_GB="${SMB_MEMORY_GB:-${SMB_MEMORY_GB_COMPUTED}}"
 export SMB_WALLTIME_HOURS="${SMB_WALLTIME_HOURS:-12}"
 export SMB_NODE_COUNT="${SMB_NODE_COUNT:-${SLURM_JOB_NUM_NODES:-1}}"
 export SMB_ALLOW_CPU_MODE="${SMB_ALLOW_CPU_MODE:-1}"
-export SMB_ALLOW_GPU_MODE="${SMB_ALLOW_GPU_MODE:-1}"
+export SMB_ALLOW_GPU_MODE="${SMB_ALLOW_GPU_MODE:-0}"
 export SMB_PREFERRED_SIMULATION_MODE="${SMB_PREFERRED_SIMULATION_MODE:-cpu}"
-export SMB_PREFERRED_LLM_MODE="${SMB_PREFERRED_LLM_MODE:-gpu}"
+export SMB_PREFERRED_LLM_MODE="${SMB_PREFERRED_LLM_MODE:-remote_api}"
 export SMB_LOW_FIDELITY_HINT="${SMB_LOW_FIDELITY_HINT:-nfex=4,nfet=2,ncp=1}"
 export SMB_MEDIUM_FIDELITY_HINT="${SMB_MEDIUM_FIDELITY_HINT:-nfex=6,nfet=3,ncp=2}"
 export SMB_HIGH_FIDELITY_HINT="${SMB_HIGH_FIDELITY_HINT:-nfex=10,nfet=5,ncp=2,nc=(1,2,3,2)}"
@@ -196,11 +196,16 @@ export SMB_BENCHMARK_HOURS="${SMB_BENCHMARK_HOURS:-12.0}"
 export SMB_SEARCH_BUDGET_HOURS="${SMB_SEARCH_BUDGET_HOURS:-10.0}"
 export SMB_VALIDATION_BUDGET_HOURS="${SMB_VALIDATION_BUDGET_HOURS:-2.0}"
 export SMB_MIN_PROBE_REFERENCE_RUNS="${SMB_MIN_PROBE_REFERENCE_RUNS:-3}"
+export SMB_SCREENING_RUNS_MIN_PER_NC="${SMB_SCREENING_RUNS_MIN_PER_NC:-3}"
+export SMB_SCREENING_RUNS_MAX_PER_NC="${SMB_SCREENING_RUNS_MAX_PER_NC:-4}"
 export SMB_SINGLE_SCIENTIST_MODE="${SMB_SINGLE_SCIENTIST_MODE:-1}"
 export SMB_PROBE_LOW_FIDELITY_ENABLED="${SMB_PROBE_LOW_FIDELITY_ENABLED:-1}"
 export SMB_PROBE_NFEX="${SMB_PROBE_NFEX:-5}"
 export SMB_PROBE_NFET="${SMB_PROBE_NFET:-2}"
 export SMB_PROBE_NCP="${SMB_PROBE_NCP:-1}"
+export SMB_NEAR_FEASIBLE_VIOLATION_THRESHOLD="${SMB_NEAR_FEASIBLE_VIOLATION_THRESHOLD:-1e-5}"
+export SMB_NEAR_FEASIBLE_PURITY_SLACK="${SMB_NEAR_FEASIBLE_PURITY_SLACK:-0.005}"
+export SMB_NEAR_FEASIBLE_RECOVERY_SLACK="${SMB_NEAR_FEASIBLE_RECOVERY_SLACK:-0.005}"
 export SMB_FINALIZATION_HARD_GATE_ENABLED="${SMB_FINALIZATION_HARD_GATE_ENABLED:-1}"
 export SMB_FINALIZATION_LOW_FIDELITY_NFEX="${SMB_FINALIZATION_LOW_FIDELITY_NFEX:-${SMB_PROBE_NFEX}}"
 export SMB_FINALIZATION_LOW_FIDELITY_NFET="${SMB_FINALIZATION_LOW_FIDELITY_NFET:-${SMB_PROBE_NFET}}"
@@ -208,6 +213,18 @@ export SMB_FINALIZATION_LOW_FIDELITY_NCP="${SMB_FINALIZATION_LOW_FIDELITY_NCP:-$
 export SMB_IPOPT_MAX_ITER="${SMB_IPOPT_MAX_ITER:-1000}"
 export SMB_IPOPT_TOL="${SMB_IPOPT_TOL:-1e-5}"
 export SMB_IPOPT_ACCEPTABLE_TOL="${SMB_IPOPT_ACCEPTABLE_TOL:-1e-4}"
+export SMB_SCREENING_IPOPT_MAX_ITER="${SMB_SCREENING_IPOPT_MAX_ITER:-800}"
+export SMB_SCREENING_IPOPT_TOL="${SMB_SCREENING_IPOPT_TOL:-1e-4}"
+export SMB_SCREENING_IPOPT_ACCEPTABLE_TOL="${SMB_SCREENING_IPOPT_ACCEPTABLE_TOL:-1e-3}"
+export SMB_SCREENING_IPOPT_MAX_SOLVE_SECONDS="${SMB_SCREENING_IPOPT_MAX_SOLVE_SECONDS:-180}"
+export SMB_NEAR_FEASIBLE_IPOPT_MAX_ITER="${SMB_NEAR_FEASIBLE_IPOPT_MAX_ITER:-1500}"
+export SMB_NEAR_FEASIBLE_IPOPT_TOL="${SMB_NEAR_FEASIBLE_IPOPT_TOL:-5e-5}"
+export SMB_NEAR_FEASIBLE_IPOPT_ACCEPTABLE_TOL="${SMB_NEAR_FEASIBLE_IPOPT_ACCEPTABLE_TOL:-5e-4}"
+export SMB_NEAR_FEASIBLE_IPOPT_MAX_SOLVE_SECONDS="${SMB_NEAR_FEASIBLE_IPOPT_MAX_SOLVE_SECONDS:-600}"
+export SMB_FINALIZATION_IPOPT_MAX_ITER="${SMB_FINALIZATION_IPOPT_MAX_ITER:-1000}"
+export SMB_FINALIZATION_IPOPT_TOL="${SMB_FINALIZATION_IPOPT_TOL:-1e-4}"
+export SMB_FINALIZATION_IPOPT_ACCEPTABLE_TOL="${SMB_FINALIZATION_IPOPT_ACCEPTABLE_TOL:-1e-3}"
+export SMB_FINALIZATION_IPOPT_MAX_SOLVE_SECONDS="${SMB_FINALIZATION_IPOPT_MAX_SOLVE_SECONDS:-600}"
 export SMB_EXECUTIVE_CONTROLLER_ENABLED="${SMB_EXECUTIVE_CONTROLLER_ENABLED:-1}"
 export SMB_EXECUTIVE_TRIGGER_REJECTS="${SMB_EXECUTIVE_TRIGGER_REJECTS:-1}"
 export SMB_EXECUTIVE_FORCE_AFTER_REJECTS="${SMB_EXECUTIVE_FORCE_AFTER_REJECTS:-2}"
@@ -221,7 +238,7 @@ export SMB_EXECUTIVE_WATCHDOG_MIN_ITERS="${SMB_EXECUTIVE_WATCHDOG_MIN_ITERS:-80}
 export SMB_EXECUTIVE_WATCHDOG_STALL_WINDOWS="${SMB_EXECUTIVE_WATCHDOG_STALL_WINDOWS:-2}"
 export SMB_EXECUTIVE_WATCHDOG_MAX_INF_DU="${SMB_EXECUTIVE_WATCHDOG_MAX_INF_DU:-0}"
 export SMB_EXECUTIVE_WATCHDOG_MAX_MUMPS_REALLOC="${SMB_EXECUTIVE_WATCHDOG_MAX_MUMPS_REALLOC:-4}"
-export SMB_MAX_SOLVE_SECONDS="${SMB_MAX_SOLVE_SECONDS:-1800}"
+export SMB_MAX_SOLVE_SECONDS="${SMB_MAX_SOLVE_SECONDS:-600}"
 export SMB_AGENT_TEE="${SMB_AGENT_TEE:-1}"
 export SMB_OBJECTIVES_FILE="${SMB_OBJECTIVES_FILE:-${OBJECTIVES_FILE}}"
 export SMB_LLM_SOUL_FILE="${SMB_LLM_SOUL_FILE:-${LLM_SOUL_FILE}}"
@@ -249,7 +266,7 @@ if [[ "${SMB_FORCE_MUMPS_ONLY}" == "1" && "${SMB_LINEAR_SOLVER}" != "mumps" ]]; 
 fi
 export SMB_CURRENT_DEFAULT_SOLVER_STACK="${SMB_CURRENT_DEFAULT_SOLVER_STACK:-pyomo+ipopt_sens+mumps}"
 export SMB_AVAILABLE_SOLVER_OPTIONS="${SMB_AVAILABLE_SOLVER_OPTIONS:-pyomo+ipopt_sens+mumps(forced_default_cpu)}"
-export SMB_AVAILABLE_ACCELERATION_OPTIONS="${SMB_AVAILABLE_ACCELERATION_OPTIONS:-optimized_blas_lapack_if_available; warm_starts; cpu_parallel_screening; fidelity_ladder; gpu_for_qwen_inference; experimental_gpu_nlp_solver_if_installed}"
+export SMB_AVAILABLE_ACCELERATION_OPTIONS="${SMB_AVAILABLE_ACCELERATION_OPTIONS:-optimized_blas_lapack_if_available; warm_starts; cpu_parallel_screening; fidelity_ladder; remote_api_llm_inference}"
 export SMB_RESOURCE_DECISION_POLICY="${SMB_RESOURCE_DECISION_POLICY:-model_may_choose_best_available_option_after_checking_installation_runtime_and_solution_quality}"
 export SMB_IPOPT_PROFILE_MENU="${SMB_IPOPT_PROFILE_MENU:-baseline_reproduction; screening_fast; balanced_cpu_mumps; robust_cpu_ma97; robust_cpu_mumps; high_end_pardiso; validation_strict}"
 export SMB_IPOPT_BASELINE_FALLBACK_TREE="${SMB_IPOPT_BASELINE_FALLBACK_TREE:-baseline_reproduction -> robust_cpu_mumps -> validation_strict}"
@@ -260,10 +277,11 @@ export SMB_COMPUTE_SUMMARY="nodes=${SMB_NODE_COUNT}; cpus=${SMB_CPU_TASKS}; gpus
 
 START_LOCAL_LLM="${START_LOCAL_LLM:-0}"
 LOCAL_LLM_BACKEND="${LOCAL_LLM_BACKEND:-ollama}"
-LOCAL_LLM_USE_GPU="${LOCAL_LLM_USE_GPU:-1}"
+LOCAL_LLM_USE_GPU="${LOCAL_LLM_USE_GPU:-0}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-${SMB_LOCAL_LLM_MODEL}}"
 OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
-OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://${OLLAMA_HOST}/v1}"
+OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-${OPENAI_BASE_URL:-https://api.openai.com/v1}}"
+export OLLAMA_API_KEY="${OLLAMA_API_KEY:-${OPENAI_API_KEY:-}}"
 OLLAMA_LOG="${OLLAMA_LOG:-$LOG_DIR/ollama-smb-${SLURM_JOB_ID:-local}.log}"
 OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-30m}"
 OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
@@ -273,9 +291,9 @@ OLLAMA_GPU_ID="${OLLAMA_GPU_ID:-}"
 SMB_OLLAMA_PULL_IF_MISSING="${SMB_OLLAMA_PULL_IF_MISSING:-0}"
 SMB_OLLAMA_PREWARM_ENABLED="${SMB_OLLAMA_PREWARM_ENABLED:-1}"
 SMB_OLLAMA_PREWARM_MAX_SECONDS="${SMB_OLLAMA_PREWARM_MAX_SECONDS:-45}"
-export SMB_FALLBACK_LLM_ENABLED="${SMB_FALLBACK_LLM_ENABLED:-1}"
+export SMB_FALLBACK_LLM_ENABLED="${SMB_FALLBACK_LLM_ENABLED:-0}"
 export SMB_FALLBACK_LLM_BASE_URL="${SMB_FALLBACK_LLM_BASE_URL:-${OPENAI_BASE_URL:-https://api.openai.com/v1}}"
-export SMB_FALLBACK_LLM_MODEL="${SMB_FALLBACK_LLM_MODEL:-gpt-5-nano}"
+export SMB_FALLBACK_LLM_MODEL="${SMB_FALLBACK_LLM_MODEL:-gpt-5.4-mini}"
 export SMB_FALLBACK_LLM_API_KEY="${SMB_FALLBACK_LLM_API_KEY:-${OPENAI_API_KEY:-}}"
 if [[ "${SMB_TSTEP_BOUNDS}" != *,* ]]; then
   echo "ERROR: SMB_TSTEP_BOUNDS='${SMB_TSTEP_BOUNDS}' is invalid. Expected 'min,max' (for example: 8.0,12.0)." >&2
@@ -444,7 +462,7 @@ start_local_qwen() {
     return 1
   fi
   if ! ollama_exec="$(resolve_ollama_bin)"; then
-    echo "WARN: ollama not found on PATH; local Qwen will not be started."
+    echo "WARN: ollama not found on PATH; local Ollama endpoint will not be started."
     return 1
   fi
 
@@ -456,10 +474,10 @@ start_local_qwen() {
     else
       visible_devices="${OLLAMA_GPU_ID}"
     fi
-    echo "[$(date '+%F %T')] START: local Ollama server for Qwen on GPU map '${visible_devices:-<auto>}'"
+    echo "[$(date '+%F %T')] START: local Ollama server on GPU map '${visible_devices:-<auto>}'"
   else
     visible_devices=""
-    echo "[$(date '+%F %T')] START: local Ollama server for Qwen on CPU"
+    echo "[$(date '+%F %T')] START: local Ollama server on CPU"
   fi
 
   CUDA_VISIBLE_DEVICES="${visible_devices}" \
@@ -520,14 +538,14 @@ start_local_qwen() {
     rm -f "${response_file}"
 
     if [[ ! "${http_code}" =~ ^2 ]]; then
-      echo "WARN: local Qwen prewarm failed with status=${http_code:-<curl-error>} (continuing without prewarm gate)"
+      echo "WARN: local Ollama prewarm failed with status=${http_code:-<curl-error>} (continuing without prewarm gate)"
     fi
   fi
 
   export OLLAMA_BASE_URL="${OLLAMA_BASE_URL}"
-  export OLLAMA_API_KEY="${OLLAMA_API_KEY:-ollama}"
+  export OLLAMA_API_KEY="${OLLAMA_API_KEY:-${OPENAI_API_KEY:-ollama}}"
   export OLLAMA_MODEL="${OLLAMA_MODEL}"
-  echo "[$(date '+%F %T')] READY: local Qwen available at ${OLLAMA_BASE_URL}"
+  echo "[$(date '+%F %T')] READY: local Ollama endpoint available at ${OLLAMA_BASE_URL}"
   return 0
 }
 
@@ -695,7 +713,7 @@ if [[ -n "${AGENT_ENTRYPOINT}" ]]; then
   echo "[$(date '+%F %T')] DONE: agent entrypoint"
 else
   echo "No AGENT_ENTRYPOINT provided."
-  echo "This job exported the two-scientist SMB compute budget and optional local Qwen environment."
+  echo "This job exported the two-scientist SMB compute budget and optional local Ollama environment."
   echo "Set AGENT_ENTRYPOINT when the autonomous runner is ready."
 fi
 

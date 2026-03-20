@@ -321,12 +321,64 @@ def solver_override_from_env(
     default_max_iter: int,
     default_tol: float,
     default_acceptable_tol: float,
+    default_max_solve_seconds: float,
 ) -> Dict[str, object]:
     return {
         "max_iter": int(env_or_default(f"{prefix}_MAX_ITER", str(default_max_iter))),
         "tol": float(env_or_default(f"{prefix}_TOL", str(default_tol))),
         "acceptable_tol": float(env_or_default(f"{prefix}_ACCEPTABLE_TOL", str(default_acceptable_tol))),
+        "max_solve_seconds": float(
+            env_or_default(f"{prefix}_MAX_SOLVE_SECONDS", str(default_max_solve_seconds))
+        ),
     }
+
+
+def screening_bundle_indices(
+    args: argparse.Namespace,
+    tasks: List[Dict[str, object]],
+    tried: set,
+    search_results: List[Dict[str, object]],
+    selected_idx: int,
+) -> List[int]:
+    if selected_idx < 0 or selected_idx >= len(tasks):
+        return []
+    selected_task = tasks[selected_idx]
+    if not task_is_screening_seed(selected_task):
+        return []
+    phase_state = screening_phase_state(args, tasks, search_results)
+    if not bool(phase_state.get("active")):
+        return []
+    selected_nc = tuple(int(v) for v in selected_task.get("nc", []))
+    progress = dict(phase_state.get("progress", {}))
+    required = int(dict(phase_state.get("required_by_nc", {})).get(selected_nc, 0))
+    completed = int(progress.get(selected_nc, {}).get("completed", 0))
+    remaining = max(0, required - completed)
+    if remaining <= 0:
+        return []
+
+    candidates: List[Tuple[int, int, int]] = []
+    for idx, task in enumerate(tasks):
+        if not task_is_screening_seed(task):
+            continue
+        task_nc = tuple(int(v) for v in task.get("nc", []))
+        if task_nc != selected_nc:
+            continue
+        key = (task_nc, str(task.get("seed_name", "")))
+        if key in tried:
+            continue
+        screening_rank = task.get("screening_rank")
+        candidates.append(
+            (
+                int(screening_rank) if screening_rank is not None else 999,
+                _seed_priority(task.get("seed_name")),
+                idx,
+            )
+        )
+    candidates.sort()
+    bundle = [idx for _, _, idx in candidates[:remaining]]
+    if selected_idx in bundle:
+        return bundle
+    return ([selected_idx] + bundle)[:remaining]
 
 
 def build_search_tasks(args: argparse.Namespace) -> List[Dict[str, object]]:
@@ -454,6 +506,7 @@ def search_execution_policy(
                     default_max_iter=1500,
                     default_tol=5e-5,
                     default_acceptable_tol=5e-4,
+                    default_max_solve_seconds=600.0,
                 )
                 policy["reason"] = (
                     "Near-feasible continuation: relaxed solver tolerances and higher iteration budget "
@@ -466,6 +519,7 @@ def search_execution_policy(
                 default_max_iter=1500,
                 default_tol=5e-5,
                 default_acceptable_tol=5e-4,
+                default_max_solve_seconds=600.0,
             )
             policy["reason"] = "Late screening task retained the near-feasible continuation solver profile."
             return policy
@@ -477,6 +531,7 @@ def search_execution_policy(
                     default_max_iter=1500,
                     default_tol=5e-5,
                     default_acceptable_tol=5e-4,
+                    default_max_solve_seconds=600.0,
                 )
                 policy["reason"] = (
                     "Near-feasible continuation: low-fidelity gate already satisfied for this NC, "
@@ -494,6 +549,7 @@ def search_execution_policy(
             default_max_iter=1000,
             default_tol=1e-4,
             default_acceptable_tol=1e-3,
+            default_max_solve_seconds=600.0,
         )
         policy["reason"] = (
             "Finalization hard gate precheck: forcing first non-reference optimization for this NC "
@@ -518,6 +574,7 @@ def search_execution_policy(
         default_max_iter=800,
         default_tol=1e-4,
         default_acceptable_tol=1e-3,
+        default_max_solve_seconds=180.0,
     )
     policy["reason"] = (
         "Probe phase screening task: forcing low-fidelity "
