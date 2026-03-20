@@ -2046,7 +2046,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tee", action="store_true")
 
     parser.add_argument("--nc", default="1,2,3,2")
-    parser.add_argument("--nc-library", default="1,2,3,2;2,2,2,2")
+    parser.add_argument("--nc-library", default=os.environ.get("SMB_NC_LIBRARY", "all"))
     parser.add_argument("--f1", type=float, default=2.2)
     parser.add_argument("--fdes", type=float, default=1.2)
     parser.add_argument("--fex", type=float, default=0.9)

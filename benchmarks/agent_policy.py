@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from . import run_stage as rs
 from .agent_results import (
     deterministic_select,
+    effective_flow,
     effective_violation,
     has_metric_evidence,
     has_any_feasible,
@@ -118,15 +119,122 @@ def _seed_priority(seed_name: object) -> int:
     name = str(seed_name or "").strip().lower()
     order = {
         "reference": 0,
-        "optimized_a_minus": 1,
-        "optimized_c": 2,
-        "optimized_a": 3,
-        "optimized_b": 4,
-        "optimized_a_plus": 5,
-        "optimized_2f1": 6,
-        "optimized_2f2": 7,
+        "reference_minus": 1,
+        "reference_plus": 2,
+        "reference_tstep": 3,
+        "optimized_a_minus": 10,
+        "optimized_c": 11,
+        "optimized_a": 12,
+        "optimized_b": 13,
+        "optimized_a_plus": 14,
+        "optimized_2f1": 15,
+        "optimized_2f2": 16,
     }
     return order.get(name, 100)
+
+
+def build_reference_probe_seeds(
+    ordered_seeds: List[Dict[str, object]],
+    requested_count: int,
+) -> List[Dict[str, object]]:
+    if not ordered_seeds:
+        return []
+    base_seed = next(
+        (dict(seed) for seed in ordered_seeds if str(seed.get("name", "")).strip().lower() == "reference"),
+        dict(ordered_seeds[0]),
+    )
+
+    def clone_with(name: str, **updates: float) -> Dict[str, object]:
+        probe = dict(base_seed)
+        probe["name"] = name
+        for key, value in updates.items():
+            probe[key] = float(value)
+        return probe
+
+    reference = clone_with("reference")
+    f1 = float(reference.get("F1", 2.2))
+    fdes = float(reference.get("Fdes", 1.2))
+    fex = float(reference.get("Fex", 0.9))
+    ffeed = float(reference.get("Ffeed", 1.3))
+    fraf = float(reference.get("Fraf", 1.6))
+    tstep = float(reference.get("tstep", 9.4))
+
+    probes = [
+        reference,
+        clone_with(
+            "reference_minus",
+            F1=f1 - 0.1,
+            Fdes=fdes - 0.05,
+            Fex=fex - 0.05,
+            Ffeed=ffeed - 0.1,
+            Fraf=fraf - 0.1,
+            tstep=tstep + 0.2,
+        ),
+        clone_with(
+            "reference_plus",
+            F1=f1 + 0.1,
+            Fdes=fdes + 0.05,
+            Fex=fex + 0.05,
+            Ffeed=ffeed + 0.1,
+            Fraf=fraf + 0.1,
+            tstep=tstep - 0.2,
+        ),
+        clone_with(
+            "reference_tstep",
+            F1=f1,
+            Fdes=fdes + 0.05,
+            Fex=fex,
+            Ffeed=ffeed,
+            Fraf=fraf + 0.05,
+            tstep=tstep + 0.4,
+        ),
+        clone_with(
+            "reference_balance",
+            F1=f1 + 0.05,
+            Fdes=fdes,
+            Fex=fex + 0.05,
+            Ffeed=ffeed + 0.05,
+            Fraf=fraf,
+            tstep=tstep - 0.1,
+        ),
+    ]
+    return probes[: max(1, min(requested_count, len(probes)))]
+
+
+def should_expand_reference_screening(
+    args: argparse.Namespace,
+    nc_results: List[Dict[str, object]],
+    *,
+    min_runs: int,
+    max_runs: int,
+) -> bool:
+    if max_runs <= min_runs or len(nc_results) < min_runs:
+        return False
+    first_round = nc_results[:min_runs]
+    if any(bool(item.get("feasible")) or result_is_near_feasible(args, item) for item in first_round):
+        return False
+
+    statuses = {str(item.get("status", "")).strip().lower() for item in first_round}
+    violations = [
+        effective_violation(item)
+        for item in first_round
+        if has_metric_evidence(item)
+    ]
+    purities = [
+        float(safe_result_metric(item, "purity_ex_meoh_free"))
+        for item in first_round
+        if safe_result_metric(item, "purity_ex_meoh_free") is not None
+    ]
+
+    homogeneous_failures = len(statuses) <= 1
+    narrow_violation_band = (
+        len(violations) >= 2 and (max(violations) - min(violations)) <= max(1e-6, 0.15 * max(violations))
+    )
+    narrow_purity_band = (
+        len(purities) >= 2 and (max(purities) - min(purities)) <= 0.01
+    )
+    all_failed = all(not bool(item.get("feasible")) for item in first_round)
+    return all_failed and (homogeneous_failures or (narrow_violation_band and narrow_purity_band))
 
 
 def screening_seed_names(tasks: List[Dict[str, object]]) -> List[str]:
@@ -172,7 +280,13 @@ def screening_targets_by_nc(
             and str(item.get("seed_name", "")).strip() in set(screening_names)
         ]
         established_promising_anchor = any(bool(item.get("feasible")) or result_is_near_feasible(args, item) for item in nc_results)
-        required[nc] = min_runs if established_promising_anchor else max_runs
+        if established_promising_anchor:
+            required[nc] = min_runs
+            continue
+        if should_expand_reference_screening(args, nc_results, min_runs=min_runs, max_runs=max_runs):
+            required[nc] = max_runs
+        else:
+            required[nc] = min_runs
     return required
 
 
@@ -262,8 +376,6 @@ def near_feasible_continuation_select(
     if has_any_feasible(results):
         return None, None
     phase_state = screening_phase_state(args, tasks, results)
-    if bool(phase_state.get("active")):
-        return None, None
     candidates = [item for item in results if result_is_near_feasible(args, item)]
     if not candidates:
         return None, None
@@ -279,6 +391,9 @@ def near_feasible_continuation_select(
     )
     anchor = candidates[0]
     anchor_nc = tuple(int(v) for v in anchor.get("nc", []))
+    progress = dict(phase_state.get("progress", {}))
+    if int(progress.get(anchor_nc, {}).get("completed", 0)) < int(progress.get(anchor_nc, {}).get("required", 0)):
+        return None, None
     same_nc_remaining: List[Tuple[int, Dict[str, object]]] = []
     for idx, task in enumerate(tasks):
         task_nc = tuple(int(v) for v in task.get("nc", []))
@@ -322,6 +437,7 @@ def solver_override_from_env(
     default_tol: float,
     default_acceptable_tol: float,
     default_max_solve_seconds: float,
+    default_threads_per_worker: int,
 ) -> Dict[str, object]:
     return {
         "max_iter": int(env_or_default(f"{prefix}_MAX_ITER", str(default_max_iter))),
@@ -329,6 +445,9 @@ def solver_override_from_env(
         "acceptable_tol": float(env_or_default(f"{prefix}_ACCEPTABLE_TOL", str(default_acceptable_tol))),
         "max_solve_seconds": float(
             env_or_default(f"{prefix}_MAX_SOLVE_SECONDS", str(default_max_solve_seconds))
+        ),
+        "threads_per_worker": int(
+            env_or_default(f"{prefix}_THREADS_PER_WORKER", str(default_threads_per_worker))
         ),
     }
 
@@ -392,9 +511,13 @@ def build_search_tasks(args: argparse.Namespace) -> List[Dict[str, object]]:
         [dict(seed) for seed in seed_library],
         key=lambda seed: (_seed_priority(seed.get("name")), str(seed.get("name", ""))),
     )
-    _min_runs, screening_count = screening_run_bounds(args, len(ordered_seeds))
-    screening_seeds = ordered_seeds[:screening_count]
-    remaining_seeds = ordered_seeds[screening_count:]
+    _min_runs, screening_count = screening_run_bounds(args, 5)
+    screening_seeds = build_reference_probe_seeds(ordered_seeds, screening_count)
+    screening_names = {str(seed.get("name", "")).strip().lower() for seed in screening_seeds}
+    remaining_seeds = [
+        seed for seed in ordered_seeds
+        if str(seed.get("name", "")).strip().lower() not in screening_names
+    ]
     tasks: List[Dict[str, object]] = []
     # Pass 1: screen each NC with 3-4 deterministic seeds before deeper optimization.
     for rank, seed in enumerate(screening_seeds):
@@ -439,6 +562,10 @@ def apply_probe_reference_gate(
     required_by_nc = dict(phase_state.get("required_by_nc", {}))
     if task_is_screening_seed(requested_task):
         return requested_idx, None
+    requested_completed = int(progress.get(requested_nc, {}).get("completed", 0))
+    requested_required = int(required_by_nc.get(requested_nc, 0))
+    if requested_completed >= requested_required:
+        return requested_idx, None
     preferred_nc = requested_nc if requested_nc in set(phase_state.get("incomplete_ncs", [])) else None
     forced_idx = first_untried_screening_index(tasks, tried, nc=preferred_nc)
     if forced_idx is None:
@@ -480,6 +607,229 @@ def probe_reference_runs_required(args: argparse.Namespace, tasks: List[Dict[str
     return sum(int(value) for value in required_by_nc.values())
 
 
+def best_screening_result_for_nc(
+    args: argparse.Namespace,
+    tasks: List[Dict[str, object]],
+    search_results: List[Dict[str, object]],
+    nc: Sequence[int],
+) -> Optional[Dict[str, object]]:
+    screening_lookup = {name.strip() for name in screening_seed_names(tasks)}
+    nc_tuple = tuple(int(v) for v in nc)
+    candidates = [
+        item for item in search_results
+        if tuple(int(v) for v in item.get("nc", [])) == nc_tuple
+        and str(item.get("seed_name", "")).strip() in screening_lookup
+        and has_metric_evidence(item)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            1 if bool(item.get("feasible")) else 0,
+            1 if result_is_near_feasible(args, item) else 0,
+            float(safe_result_metric(item, "productivity_ex_ga_ma") or float("-inf")),
+            float(safe_result_metric(item, "purity_ex_meoh_free") or float("-inf")),
+            float(safe_result_metric(item, "recovery_ex_GA") or float("-inf")),
+            float(safe_result_metric(item, "recovery_ex_MA") or float("-inf")),
+            -effective_violation(item),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def first_untried_task_for_nc(
+    tasks: List[Dict[str, object]],
+    tried: set,
+    nc: Sequence[int],
+    *,
+    screening_only: Optional[bool] = None,
+) -> Optional[int]:
+    target_nc = tuple(int(v) for v in nc)
+    candidates: List[Tuple[int, int, int]] = []
+    for idx, task in enumerate(tasks):
+        task_nc = tuple(int(v) for v in task.get("nc", []))
+        if task_nc != target_nc:
+            continue
+        if screening_only is True and not task_is_screening_seed(task):
+            continue
+        if screening_only is False and task_is_screening_seed(task):
+            continue
+        key = (task_nc, str(task.get("seed_name", "")))
+        if key in tried:
+            continue
+        candidates.append(
+            (
+                0 if not task_is_screening_seed(task) else 1,
+                _seed_priority(task.get("seed_name")),
+                idx,
+            )
+        )
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][2]
+
+
+def optimization_results_for_nc(
+    tasks: List[Dict[str, object]],
+    results: List[Dict[str, object]],
+    nc: Sequence[int],
+) -> List[Dict[str, object]]:
+    screening_lookup = {name.strip() for name in screening_seed_names(tasks)}
+    nc_tuple = tuple(int(v) for v in nc)
+    return [
+        item
+        for item in results
+        if tuple(int(v) for v in item.get("nc", [])) == nc_tuple
+        and str(item.get("seed_name", "")).strip() not in screening_lookup
+    ]
+
+
+def choose_next_nc_to_screen(
+    args: argparse.Namespace,
+    tasks: List[Dict[str, object]],
+    tried: set,
+    results: List[Dict[str, object]],
+    *,
+    exclude_nc: Optional[Sequence[int]] = None,
+) -> Optional[Tuple[int, ...]]:
+    phase_state = screening_phase_state(args, tasks, results)
+    progress = dict(phase_state.get("progress", {}))
+    incomplete = list(phase_state.get("incomplete_ncs", []))
+    if not incomplete:
+        return None
+    excluded = tuple(int(v) for v in exclude_nc) if exclude_nc is not None else None
+    ranked: List[Tuple[int, float, Tuple[int, ...]]] = []
+    for nc in incomplete:
+        if excluded is not None and tuple(nc) == excluded:
+            continue
+        completed = int(progress.get(nc, {}).get("completed", 0))
+        ranked.append((completed, -nc_prior_score(nc), tuple(nc)))
+    if not ranked:
+        return None
+    ranked.sort()
+    return ranked[0][2]
+
+
+def outer_loop_nc_decision(
+    args: argparse.Namespace,
+    tasks: List[Dict[str, object]],
+    tried: set,
+    results: List[Dict[str, object]],
+) -> Tuple[Optional[int], Optional[Dict[str, object]]]:
+    if not results:
+        return None, None
+    current_nc = tuple(int(v) for v in results[-1].get("nc", []))
+    if len(current_nc) != 4:
+        return None, None
+
+    phase_state = screening_phase_state(args, tasks, results)
+    progress = dict(phase_state.get("progress", {}))
+    current_completed = int(progress.get(current_nc, {}).get("completed", 0))
+    current_required = int(progress.get(current_nc, {}).get("required", 0))
+
+    if current_completed < current_required:
+        idx = first_untried_task_for_nc(tasks, tried, current_nc, screening_only=True)
+        if idx is None:
+            return None, None
+        return idx, {
+            "mode": "outer_loop_nc_controller",
+            "decision": "continue_current_nc",
+            "reason": (
+                f"Current NC {list(current_nc)} still needs reference screening "
+                f"({current_completed}/{current_required}); continue current NC before rotating."
+            ),
+            "acquisition_type": "EXPLORE",
+            "priority_updates": [
+                "Complete required reference coverage for the current NC before switching."
+            ],
+            "target_nc": list(current_nc),
+        }
+
+    best_screen = best_screening_result_for_nc(args, tasks, results, current_nc)
+    nc_optimization_results = optimization_results_for_nc(tasks, results, current_nc)
+    if not nc_optimization_results:
+        idx = first_untried_task_for_nc(tasks, tried, current_nc, screening_only=False)
+        if idx is None:
+            return None, None
+        return idx, {
+            "mode": "outer_loop_nc_controller",
+            "decision": "continue_current_nc",
+            "reason": (
+                f"Reference screening is complete for nc={list(current_nc)} and no optimization run has been attempted yet; "
+                "use the best screening anchor before switching NC."
+            ),
+            "acquisition_type": "VERIFY",
+            "priority_updates": [
+                "Launch the first anchored optimization for the current NC before rotating."
+            ],
+            "target_nc": list(current_nc),
+            "anchor_run_name": str(best_screen.get("run_name", "")) if isinstance(best_screen, dict) else "",
+        }
+
+    if any(bool(item.get("feasible")) or result_is_near_feasible(args, item) for item in nc_optimization_results):
+        idx = first_untried_task_for_nc(tasks, tried, current_nc, screening_only=False)
+        if idx is None:
+            return None, None
+        return idx, {
+            "mode": "outer_loop_nc_controller",
+            "decision": "continue_current_nc",
+            "reason": (
+                f"Current NC {list(current_nc)} has feasible or near-feasible optimization evidence; continue exploiting this NC."
+            ),
+            "acquisition_type": "VERIFY",
+            "priority_updates": [
+                "Stay on the current NC because it has the strongest evidence-backed basin."
+            ],
+            "target_nc": list(current_nc),
+        }
+
+    best_opt_violation = min((effective_violation(item) for item in nc_optimization_results), default=float("inf"))
+    best_screen_violation = effective_violation(best_screen) if isinstance(best_screen, dict) else float("inf")
+    improvement = best_screen_violation - best_opt_violation
+    meaningful_improvement = improvement > max(1e-6, 0.1 * best_screen_violation)
+
+    if meaningful_improvement:
+        idx = first_untried_task_for_nc(tasks, tried, current_nc, screening_only=False)
+        if idx is None:
+            return None, None
+        return idx, {
+            "mode": "outer_loop_nc_controller",
+            "decision": "continue_current_nc",
+            "reason": (
+                f"Current NC {list(current_nc)} is still improving under optimization "
+                f"(best screening viol={best_screen_violation:.6g}, best optimization viol={best_opt_violation:.6g})."
+            ),
+            "acquisition_type": "VERIFY",
+            "priority_updates": [
+                "Continue the current NC because optimization is still moving the evidence frontier."
+            ],
+            "target_nc": list(current_nc),
+        }
+
+    next_nc = choose_next_nc_to_screen(args, tasks, tried, results, exclude_nc=current_nc)
+    if next_nc is None:
+        return None, None
+    idx = first_untried_task_for_nc(tasks, tried, next_nc, screening_only=True)
+    if idx is None:
+        return None, None
+    return idx, {
+        "mode": "outer_loop_nc_controller",
+        "decision": "switch_nc",
+        "reason": (
+            f"Current NC {list(current_nc)} completed screening and at least one optimization run without meaningful progress; "
+            f"switch to nc={list(next_nc)} for broader layout discovery."
+        ),
+        "acquisition_type": "EXPLORE",
+        "priority_updates": [
+            "Rotate to the next NC because the current NC is screened and no longer improving enough."
+        ],
+        "previous_nc": list(current_nc),
+        "target_nc": list(next_nc),
+    }
+
+
 def search_execution_policy(
     args: argparse.Namespace,
     tasks: List[Dict[str, object]],
@@ -506,7 +856,8 @@ def search_execution_policy(
                     default_max_iter=1500,
                     default_tol=5e-5,
                     default_acceptable_tol=5e-4,
-                    default_max_solve_seconds=600.0,
+                    default_max_solve_seconds=300.0,
+                    default_threads_per_worker=4,
                 )
                 policy["reason"] = (
                     "Near-feasible continuation: relaxed solver tolerances and higher iteration budget "
@@ -519,7 +870,8 @@ def search_execution_policy(
                 default_max_iter=1500,
                 default_tol=5e-5,
                 default_acceptable_tol=5e-4,
-                default_max_solve_seconds=600.0,
+                default_max_solve_seconds=300.0,
+                default_threads_per_worker=4,
             )
             policy["reason"] = "Late screening task retained the near-feasible continuation solver profile."
             return policy
@@ -531,13 +883,36 @@ def search_execution_policy(
                     default_max_iter=1500,
                     default_tol=5e-5,
                     default_acceptable_tol=5e-4,
-                    default_max_solve_seconds=600.0,
+                    default_max_solve_seconds=300.0,
+                    default_threads_per_worker=4,
                 )
                 policy["reason"] = (
                     "Near-feasible continuation: low-fidelity gate already satisfied for this NC, "
                     "so keep the local continuation profile."
                 )
             return policy
+        best_screen = best_screening_result_for_nc(args, tasks, search_results, nc)
+        if best_screen is not None:
+            best_flow = effective_flow(best_screen)
+            if best_flow is not None:
+                if isinstance(best_flow, dict):
+                    policy["flow_override"] = {
+                        "Ffeed": float(best_flow["Ffeed"]),
+                        "F1": float(best_flow["F1"]),
+                        "Fdes": float(best_flow["Fdes"]),
+                        "Fex": float(best_flow["Fex"]),
+                        "Fraf": float(best_flow["Fraf"]),
+                        "tstep": float(best_flow["tstep"]),
+                    }
+                else:
+                    policy["flow_override"] = {
+                        "Ffeed": float(best_flow.Ffeed),
+                        "F1": float(best_flow.F1),
+                        "Fdes": float(best_flow.Fdes),
+                        "Fex": float(best_flow.Fex),
+                        "Fraf": float(best_flow.Fraf),
+                        "tstep": float(best_flow.tstep),
+                    }
         limits = low_fidelity_limits(args)
         policy["fidelity_override"] = {
             "nfex": limits["nfex"],
@@ -549,13 +924,16 @@ def search_execution_policy(
             default_max_iter=1000,
             default_tol=1e-4,
             default_acceptable_tol=1e-3,
-            default_max_solve_seconds=600.0,
+            default_max_solve_seconds=300.0,
+            default_threads_per_worker=4,
         )
         policy["reason"] = (
             "Finalization hard gate precheck: forcing first non-reference optimization for this NC "
             f"to low-fidelity (nfex={limits['nfex']}, nfet={limits['nfet']}, ncp={limits['ncp']}) "
             "before expensive final optimization is allowed."
         )
+        if best_screen is not None:
+            policy["reason"] += f" Initial flow anchor taken from best screening run '{best_screen.get('run_name')}'."
         return policy
     if not low_fidelity_enabled:
         policy["reason"] = "Probe phase active, but low-fidelity override is disabled."
@@ -575,6 +953,7 @@ def search_execution_policy(
         default_tol=1e-4,
         default_acceptable_tol=1e-3,
         default_max_solve_seconds=180.0,
+        default_threads_per_worker=1,
     )
     policy["reason"] = (
         "Probe phase screening task: forcing low-fidelity "

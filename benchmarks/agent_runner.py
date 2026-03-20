@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -50,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--research-md", default=os.environ.get("SMB_RESEARCH_MD", str(REPO_ROOT / "research.md")))
     parser.add_argument("--research-tail-chars", type=int, default=int(os.environ.get("SMB_RESEARCH_TAIL_CHARS", "1200")))
     parser.add_argument("--reset-research-section", action="store_true", default=os.environ.get("SMB_RESEARCH_RESET_SECTION", "0") == "1")
-    parser.add_argument("--nc-library", default=os.environ.get("SMB_NC_LIBRARY", "1,2,3,2;2,2,2,2;1,3,2,2"))
+    parser.add_argument("--nc-library", default=os.environ.get("SMB_NC_LIBRARY", "all"))
     parser.add_argument("--seed-library", default=os.environ.get("SMB_SEED_LIBRARY", "notebook"))
     parser.add_argument("--solver-name", default=os.environ.get("SMB_SOLVER_NAME", "auto"))
     parser.add_argument("--linear-solver", default=os.environ.get("SMB_LINEAR_SOLVER", "mumps"))
@@ -828,7 +829,11 @@ def execute_search_task(
         solver_override=solver_override,
         flow_override=flow_override,
     )
-    result = rs.evaluate_optimized_layout(candidate_args, tuple(task["nc"]))
+    threads_override = None
+    if isinstance(solver_override, dict) and solver_override.get("threads_per_worker") is not None:
+        threads_override = max(1, int(solver_override.get("threads_per_worker", 1)))
+    with temporary_worker_thread_env(threads_override):
+        result = rs.evaluate_optimized_layout(candidate_args, tuple(task["nc"]))
     if isinstance(fidelity_override, dict) or isinstance(solver_override, dict) or isinstance(flow_override, dict) or execution_note:
         result["execution_policy"] = {
             "fidelity_override": fidelity_override or {},
@@ -837,6 +842,24 @@ def execute_search_task(
             "note": execution_note,
         }
     return result
+
+
+@contextlib.contextmanager
+def temporary_worker_thread_env(threads_per_worker: Optional[int]):
+    if threads_per_worker is None:
+        yield
+        return
+    keys = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+    original = {key: os.environ.get(key) for key in keys}
+    rs.apply_worker_thread_env(int(threads_per_worker))
+    try:
+        yield
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def build_search_candidate_args(
@@ -910,6 +933,9 @@ def execute_search_task_batch(
     if not tasks:
         return []
     profile = rs.resolve_ipopt_parallel_profile(args)
+    worker_threads = int(profile["threads_per_worker"])
+    if isinstance(solver_override, dict) and solver_override.get("threads_per_worker") is not None:
+        worker_threads = max(1, int(solver_override.get("threads_per_worker", worker_threads)))
     payloads: List[Dict[str, object]] = []
     for task in tasks:
         flow_override = task.get("flow_override") if isinstance(task.get("flow_override"), dict) else None
@@ -925,13 +951,13 @@ def execute_search_task_batch(
                 "stage": "optimized",
                 "args": dict(vars(candidate_args)),
                 "nc": list(task["nc"]),
-                "threads_per_worker": int(profile["threads_per_worker"]),
+                "threads_per_worker": worker_threads,
             }
         )
     results = rs.run_parallel_stage_tasks(
         payloads,
         workers=int(profile["workers"]),
-        threads_per_worker=int(profile["threads_per_worker"]),
+        threads_per_worker=worker_threads,
     )
     batch_size = len(results)
     for batch_index, result in enumerate(results):
@@ -943,7 +969,7 @@ def execute_search_task_batch(
             "batch_index": batch_index,
             "batch_size": batch_size,
             "parallel_workers": int(profile["workers"]),
-            "threads_per_worker": int(profile["threads_per_worker"]),
+            "threads_per_worker": worker_threads,
         }
     return results
 
@@ -1241,6 +1267,8 @@ probe_reference_runs_required = split_policy.probe_reference_runs_required
 search_execution_policy = split_policy.search_execution_policy
 near_feasible_continuation_select = split_policy.near_feasible_continuation_select
 screening_bundle_indices = split_policy.screening_bundle_indices
+screening_targets_by_nc = split_policy.screening_targets_by_nc
+outer_loop_nc_decision = split_policy.outer_loop_nc_decision
 deterministic_review = split_policy.deterministic_review
 single_scientist_policy_review = split_policy.single_scientist_policy_review
 executive_controller_decide = split_policy.executive_controller_decide
@@ -1670,7 +1698,11 @@ def main() -> int:
                         if isinstance(execution_policy.get("solver_override"), dict)
                         else None
                     ),
-                    flow_override=effective_task.get("flow") if isinstance(effective_task.get("flow"), dict) else None,
+                    flow_override=(
+                        execution_policy.get("flow_override")
+                        if isinstance(execution_policy.get("flow_override"), dict)
+                        else (effective_task.get("flow") if isinstance(effective_task.get("flow"), dict) else None)
+                    ),
                     execution_note=str(execution_policy.get("reason", "")),
                 )
                 progress_log(
@@ -1820,7 +1852,11 @@ def main() -> int:
                         if isinstance(execution_policy.get("solver_override"), dict)
                         else None
                     ),
-                    flow_override=effective_task.get("flow") if isinstance(effective_task.get("flow"), dict) else None,
+                    flow_override=(
+                        execution_policy.get("flow_override")
+                        if isinstance(execution_policy.get("flow_override"), dict)
+                        else (effective_task.get("flow") if isinstance(effective_task.get("flow"), dict) else None)
+                    ),
                     execution_note=str(execution_policy.get("reason", "")),
                 )
                 progress_log(
@@ -1881,6 +1917,8 @@ def main() -> int:
                 continue
             continuation_idx = None
             continuation_note = None
+            outer_loop_idx = None
+            outer_loop_note = None
             if not bootstrap_mode:
                 continuation_idx, continuation_note = near_feasible_continuation_select(
                     args,
@@ -1888,6 +1926,13 @@ def main() -> int:
                     tried,
                     search_results,
                 )
+                if continuation_idx is None:
+                    outer_loop_idx, outer_loop_note = outer_loop_nc_decision(
+                        args,
+                        search_tasks,
+                        tried,
+                        search_results,
+                    )
             if bootstrap_mode:
                 idx = bootstrap_reference_select(search_tasks, tried)
                 a_note = {
@@ -1928,6 +1973,27 @@ def main() -> int:
                         "Policy override held topology constant to continue around the best near-feasible basin."
                     ],
                     "evidence_refs": [str(continuation_note.get("anchor_run_name", ""))],
+                }
+            elif outer_loop_idx is not None and outer_loop_note is not None:
+                idx = outer_loop_idx
+                evidence_lines = []
+                target_nc = outer_loop_note.get("target_nc")
+                if isinstance(target_nc, list) and target_nc:
+                    evidence_lines.append(f"target_nc={target_nc}")
+                anchor_run_name = str(outer_loop_note.get("anchor_run_name", "")).strip()
+                if anchor_run_name:
+                    evidence_lines.append(f"anchor_run={anchor_run_name}")
+                a_note = {
+                    "mode": str(outer_loop_note.get("mode", "outer_loop_nc_controller")),
+                    "decision": str(outer_loop_note.get("decision", "")),
+                    "reason": str(outer_loop_note.get("reason", "")),
+                    "acquisition_type": str(outer_loop_note.get("acquisition_type", "VERIFY")),
+                    "priority_updates": list(outer_loop_note.get("priority_updates", [])),
+                    "evidence": evidence_lines,
+                    "comparison_to_previous": [
+                        "Outer-loop NC controller explicitly decided whether to continue the current NC or rotate."
+                    ],
+                    "evidence_refs": [anchor_run_name] if anchor_run_name else [],
                 }
             else:
                 try:
@@ -2345,7 +2411,11 @@ def main() -> int:
                         if isinstance(execution_policy.get("solver_override"), dict)
                         else None
                     ),
-                    flow_override=selected_effective_task.get("flow") if isinstance(selected_effective_task.get("flow"), dict) else None,
+                    flow_override=(
+                        execution_policy.get("flow_override")
+                        if isinstance(execution_policy.get("flow_override"), dict)
+                        else (selected_effective_task.get("flow") if isinstance(selected_effective_task.get("flow"), dict) else None)
+                    ),
                     execution_note=str(execution_policy.get("reason", "")),
                 )
                 progress_log(
@@ -2496,6 +2566,11 @@ def main() -> int:
                         if isinstance(forced_policy.get("solver_override"), dict)
                         else None
                     ),
+                    flow_override=(
+                        forced_policy.get("flow_override")
+                        if isinstance(forced_policy.get("flow_override"), dict)
+                        else None
+                    ),
                     execution_note=str(forced_policy.get("reason", "")),
                 )
                 progress_log(
@@ -2607,6 +2682,11 @@ def main() -> int:
                     task,
                     fidelity_override=fidelity_override,
                     solver_override=solver_override,
+                    flow_override=(
+                        execution_policy.get("flow_override")
+                        if isinstance(execution_policy.get("flow_override"), dict)
+                        else None
+                    ),
                     execution_note=str(execution_policy.get("reason", "")),
                 )
                 progress_log(
