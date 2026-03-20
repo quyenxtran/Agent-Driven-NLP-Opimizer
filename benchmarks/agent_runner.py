@@ -154,6 +154,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=int(os.environ.get("SMB_MIN_PROBE_REFERENCE_RUNS", "3")),
     )
     parser.add_argument(
+        "--screening-runs-per-nc",
+        type=int,
+        default=int(os.environ.get("SMB_SCREENING_RUNS_PER_NC", os.environ.get("SMB_MIN_PROBE_REFERENCE_RUNS", "4"))),
+    )
+    parser.add_argument(
+        "--screening-runs-min-per-nc",
+        type=int,
+        default=int(os.environ.get("SMB_SCREENING_RUNS_MIN_PER_NC", os.environ.get("SMB_MIN_PROBE_REFERENCE_RUNS", "3"))),
+    )
+    parser.add_argument(
+        "--screening-runs-max-per-nc",
+        type=int,
+        default=int(os.environ.get("SMB_SCREENING_RUNS_MAX_PER_NC", os.environ.get("SMB_SCREENING_RUNS_PER_NC", "4"))),
+    )
+    parser.add_argument(
         "--probe-low-fidelity-enabled",
         type=int,
         default=int(os.environ.get("SMB_PROBE_LOW_FIDELITY_ENABLED", "1")),
@@ -192,6 +207,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--finalization-low-fidelity-ncp",
         type=int,
         default=int(os.environ.get("SMB_FINALIZATION_LOW_FIDELITY_NCP", os.environ.get("SMB_PROBE_NCP", "1"))),
+    )
+    parser.add_argument(
+        "--near-feasible-violation-threshold",
+        type=float,
+        default=float(os.environ.get("SMB_NEAR_FEASIBLE_VIOLATION_THRESHOLD", "1e-5")),
+    )
+    parser.add_argument(
+        "--near-feasible-purity-slack",
+        type=float,
+        default=float(os.environ.get("SMB_NEAR_FEASIBLE_PURITY_SLACK", "0.005")),
+    )
+    parser.add_argument(
+        "--near-feasible-recovery-slack",
+        type=float,
+        default=float(os.environ.get("SMB_NEAR_FEASIBLE_RECOVERY_SLACK", "0.005")),
     )
     parser.add_argument("--llm-timeout-seconds", type=float, default=float(os.environ.get("SMB_LLM_TIMEOUT_SECONDS", "300")))
     parser.add_argument(
@@ -787,6 +817,7 @@ def execute_search_task(
     task: Dict[str, object],
     *,
     fidelity_override: Optional[Dict[str, int]] = None,
+    solver_override: Optional[Dict[str, object]] = None,
     flow_override: Optional[Dict[str, float]] = None,
     execution_note: str = "",
 ) -> Dict[str, object]:
@@ -811,6 +842,15 @@ def execute_search_task(
         candidate_args.nfex = max(1, int(fidelity_override.get("nfex", candidate_args.nfex)))
         candidate_args.nfet = max(1, int(fidelity_override.get("nfet", candidate_args.nfet)))
         candidate_args.ncp = max(1, int(fidelity_override.get("ncp", candidate_args.ncp)))
+    if isinstance(solver_override, dict):
+        if "max_iter" in solver_override and solver_override.get("max_iter") is not None:
+            candidate_args.max_iter = max(1, int(solver_override.get("max_iter", candidate_args.max_iter)))
+        if "tol" in solver_override and solver_override.get("tol") is not None:
+            candidate_args.tol = float(solver_override.get("tol", candidate_args.tol))
+        if "acceptable_tol" in solver_override and solver_override.get("acceptable_tol") is not None:
+            candidate_args.acceptable_tol = float(
+                solver_override.get("acceptable_tol", candidate_args.acceptable_tol)
+            )
     if isinstance(flow_override, dict):
         flow_map = {
             "Ffeed": "ffeed",
@@ -827,9 +867,10 @@ def execute_search_task(
             setattr(candidate_args, attr, float(value))
     candidate_args.run_name = f"{args.run_name}_search_nc_{'-'.join(str(v) for v in task['nc'])}_{candidate_args.seed_name}"
     result = rs.evaluate_optimized_layout(candidate_args, tuple(task["nc"]))
-    if isinstance(fidelity_override, dict) or isinstance(flow_override, dict) or execution_note:
+    if isinstance(fidelity_override, dict) or isinstance(solver_override, dict) or isinstance(flow_override, dict) or execution_note:
         result["execution_policy"] = {
             "fidelity_override": fidelity_override or {},
+            "solver_override": solver_override or {},
             "flow_override": flow_override or {},
             "note": execution_note,
         }
@@ -1127,6 +1168,7 @@ build_search_tasks = split_policy.build_search_tasks
 apply_probe_reference_gate = split_policy.apply_probe_reference_gate
 probe_reference_runs_required = split_policy.probe_reference_runs_required
 search_execution_policy = split_policy.search_execution_policy
+near_feasible_continuation_select = split_policy.near_feasible_continuation_select
 deterministic_review = split_policy.deterministic_review
 single_scientist_policy_review = split_policy.single_scientist_policy_review
 executive_controller_decide = split_policy.executive_controller_decide
@@ -1403,6 +1445,8 @@ def main() -> int:
             research_excerpt = read_research_tail(research_path, args.research_tail_chars)
             convergence_excerpt = sqlite_convergence_context(sqlite_conn, args.run_name)
             best_so_far = rank_any_results(search_results)[0] if search_results else None
+            bootstrap_target = max(0, int(getattr(args, "bootstrap_reference_runs", 0)))
+            bootstrap_mode = bootstrap_target > 0 and len(search_results) < bootstrap_target
             if force_diagnostic_next_iteration:
                 diag_idx, diag_note = physics_informed_select(
                     search_tasks,
@@ -1492,6 +1536,11 @@ def main() -> int:
                         if isinstance(execution_policy.get("fidelity_override"), dict)
                         else None
                     ),
+                    solver_override=(
+                        execution_policy.get("solver_override")
+                        if isinstance(execution_policy.get("solver_override"), dict)
+                        else None
+                    ),
                     flow_override=effective_task.get("flow") if isinstance(effective_task.get("flow"), dict) else None,
                     execution_note=str(execution_policy.get("reason", "")),
                 )
@@ -1546,6 +1595,7 @@ def main() -> int:
                 infeasibility_state = check_systematic_infeasibility(
                     search_results,
                     int(getattr(args, "systematic_infeasibility_k", 5)),
+                    near_feasible_violation_threshold=float(getattr(args, "near_feasible_violation_threshold", 1e-5)),
                 )
                 if bool(infeasibility_state.get("triggered")):
                     force_diagnostic_next_iteration = True
@@ -1636,6 +1686,11 @@ def main() -> int:
                         if isinstance(execution_policy.get("fidelity_override"), dict)
                         else None
                     ),
+                    solver_override=(
+                        execution_policy.get("solver_override")
+                        if isinstance(execution_policy.get("solver_override"), dict)
+                        else None
+                    ),
                     flow_override=effective_task.get("flow") if isinstance(effective_task.get("flow"), dict) else None,
                     execution_note=str(execution_policy.get("reason", "")),
                 )
@@ -1689,13 +1744,21 @@ def main() -> int:
                 infeasibility_state = check_systematic_infeasibility(
                     search_results,
                     int(getattr(args, "systematic_infeasibility_k", 5)),
+                    near_feasible_violation_threshold=float(getattr(args, "near_feasible_violation_threshold", 1e-5)),
                 )
                 if bool(infeasibility_state.get("triggered")):
                     force_diagnostic_next_iteration = True
                     force_diagnostic_reason = str(infeasibility_state.get("reason", ""))
                 continue
-            bootstrap_target = max(0, int(getattr(args, "bootstrap_reference_runs", 0)))
-            bootstrap_mode = bootstrap_target > 0 and len(search_results) < bootstrap_target
+            continuation_idx = None
+            continuation_note = None
+            if not bootstrap_mode:
+                continuation_idx, continuation_note = near_feasible_continuation_select(
+                    args,
+                    search_tasks,
+                    tried,
+                    search_results,
+                )
             if bootstrap_mode:
                 idx = bootstrap_reference_select(search_tasks, tried)
                 a_note = {
@@ -1717,6 +1780,25 @@ def main() -> int:
                         "Bootstrap reference run to establish initial baseline for data-grounded A/B/C comparisons."
                     ],
                     "evidence_refs": [],
+                }
+            elif continuation_idx is not None and continuation_note is not None:
+                idx = continuation_idx
+                a_note = {
+                    "mode": str(continuation_note.get("mode", "near_feasible_continuation")),
+                    "decision": str(continuation_note.get("decision", "near_feasible_continue")),
+                    "reason": str(continuation_note.get("reason", "")),
+                    "acquisition_type": str(continuation_note.get("acquisition_type", "VERIFY")),
+                    "priority_updates": list(continuation_note.get("priority_updates", [])),
+                    "evidence": [
+                        (
+                            f"anchor_run={continuation_note.get('anchor_run_name')} nc={continuation_note.get('anchor_nc')} "
+                            f"seed={continuation_note.get('anchor_seed_name')}"
+                        )
+                    ],
+                    "comparison_to_previous": [
+                        "Policy override held topology constant to continue around the best near-feasible basin."
+                    ],
+                    "evidence_refs": [str(continuation_note.get("anchor_run_name", ""))],
                 }
             else:
                 try:
@@ -2129,6 +2211,11 @@ def main() -> int:
                         if isinstance(execution_policy.get("fidelity_override"), dict)
                         else None
                     ),
+                    solver_override=(
+                        execution_policy.get("solver_override")
+                        if isinstance(execution_policy.get("solver_override"), dict)
+                        else None
+                    ),
                     flow_override=selected_effective_task.get("flow") if isinstance(selected_effective_task.get("flow"), dict) else None,
                     execution_note=str(execution_policy.get("reason", "")),
                 )
@@ -2184,6 +2271,7 @@ def main() -> int:
                 infeasibility_state = check_systematic_infeasibility(
                     search_results,
                     int(getattr(args, "systematic_infeasibility_k", 5)),
+                    near_feasible_violation_threshold=float(getattr(args, "near_feasible_violation_threshold", 1e-5)),
                 )
                 if bool(infeasibility_state.get("triggered")):
                     force_diagnostic_next_iteration = True
@@ -2274,6 +2362,11 @@ def main() -> int:
                         if isinstance(forced_policy.get("fidelity_override"), dict)
                         else None
                     ),
+                    solver_override=(
+                        forced_policy.get("solver_override")
+                        if isinstance(forced_policy.get("solver_override"), dict)
+                        else None
+                    ),
                     execution_note=str(forced_policy.get("reason", "")),
                 )
                 progress_log(
@@ -2321,6 +2414,7 @@ def main() -> int:
                 infeasibility_state = check_systematic_infeasibility(
                     search_results,
                     int(getattr(args, "systematic_infeasibility_k", 5)),
+                    near_feasible_violation_threshold=float(getattr(args, "near_feasible_violation_threshold", 1e-5)),
                 )
                 if bool(infeasibility_state.get("triggered")):
                     force_diagnostic_next_iteration = True
@@ -2342,6 +2436,11 @@ def main() -> int:
                 fidelity_override=(
                     execution_policy.get("fidelity_override")
                     if isinstance(execution_policy.get("fidelity_override"), dict)
+                    else None
+                ),
+                solver_override=(
+                    execution_policy.get("solver_override")
+                    if isinstance(execution_policy.get("solver_override"), dict)
                     else None
                 ),
                 execution_note=str(execution_policy.get("reason", "")),
@@ -2392,6 +2491,7 @@ def main() -> int:
             infeasibility_state = check_systematic_infeasibility(
                 search_results,
                 int(getattr(args, "systematic_infeasibility_k", 5)),
+                near_feasible_violation_threshold=float(getattr(args, "near_feasible_violation_threshold", 1e-5)),
             )
             if bool(infeasibility_state.get("triggered")):
                 force_diagnostic_next_iteration = True

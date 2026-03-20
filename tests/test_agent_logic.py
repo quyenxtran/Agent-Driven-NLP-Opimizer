@@ -69,6 +69,9 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "search_hours": 10.0,
         "validation_hours": 2.0,
         "min_probe_reference_runs": 0,
+        "screening_runs_per_nc": 4,
+        "screening_runs_min_per_nc": 3,
+        "screening_runs_max_per_nc": 4,
         "probe_low_fidelity_enabled": 1,
         "probe_nfex": 5,
         "probe_nfet": 2,
@@ -101,6 +104,9 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "project_purity_min": 0.6,
         "project_recovery_ga_min": 0.75,
         "project_recovery_ma_min": 0.75,
+        "near_feasible_violation_threshold": 1e-5,
+        "near_feasible_purity_slack": 0.005,
+        "near_feasible_recovery_slack": 0.005,
         "meoh_max_raff_wt": 1.0,
         "water_max_ex_wt": 1.0,
         "water_max_zone1_entry_wt": 1.0,
@@ -192,6 +198,117 @@ def test_bootstrap_reference_select_prefers_reference_seed() -> None:
     ]
     idx = ar.bootstrap_reference_select(tasks, tried=set())
     assert idx == 1
+
+
+def test_apply_probe_reference_gate_forces_screening_for_same_nc_when_missing() -> None:
+    args = make_args(screening_runs_per_nc=2, screening_runs_min_per_nc=2, screening_runs_max_per_nc=2)
+    tasks = [
+        {"nc": [2, 2, 2, 2], "seed_name": "reference", "seed": {"name": "reference"}, "screening_seed": True},
+        {"nc": [1, 3, 2, 2], "seed_name": "reference", "seed": {"name": "reference"}, "screening_seed": True},
+        {"nc": [2, 2, 2, 2], "seed_name": "optimized_a_minus", "seed": {"name": "optimized_a_minus"}, "screening_seed": True},
+        {"nc": [1, 3, 2, 2], "seed_name": "optimized_a_minus", "seed": {"name": "optimized_a_minus"}, "screening_seed": True},
+        {"nc": [2, 2, 2, 2], "seed_name": "optimized_b", "seed": {"name": "optimized_b"}, "screening_seed": False},
+    ]
+    results = [
+        sample_result(
+            "run_ref_other",
+            feasible=False,
+            status="solver_error",
+            j=None,
+            productivity=0.005,
+            purity=0.59,
+            rga=0.74,
+            rma=0.74,
+            violation=0.01,
+            nc=[1, 3, 2, 2],
+        )
+    ]
+    idx, note = ar.apply_probe_reference_gate(args, tasks, tried=set(), search_results=results, requested_idx=4)
+    assert idx == 0
+    assert note is not None
+    assert note["applied"] is True
+    assert note["forced_task"]["nc"] == [2, 2, 2, 2]
+    assert note["forced_task"]["seed_name"] == "reference"
+
+
+def test_apply_probe_reference_gate_allows_nonreference_when_nc_screening_met() -> None:
+    args = make_args(screening_runs_per_nc=2, screening_runs_min_per_nc=2, screening_runs_max_per_nc=2)
+    tasks = [
+        {"nc": [2, 2, 2, 2], "seed_name": "reference", "seed": {"name": "reference"}, "screening_seed": True},
+        {"nc": [2, 2, 2, 2], "seed_name": "optimized_a_minus", "seed": {"name": "optimized_a_minus"}, "screening_seed": True},
+        {"nc": [2, 2, 2, 2], "seed_name": "optimized_b", "seed": {"name": "optimized_b"}, "screening_seed": False},
+    ]
+    results = [
+        sample_result("run_ref", feasible=False, status="solver_error", j=None, productivity=0.005, purity=0.59, rga=0.74, rma=0.74, violation=0.01, nc=[2, 2, 2, 2]),
+        sample_result("run_ref_2", feasible=False, status="solver_error", j=None, productivity=0.006, purity=0.595, rga=0.745, rma=0.745, violation=0.008, nc=[2, 2, 2, 2]),
+    ]
+    results[0]["seed_name"] = "reference"
+    results[1]["seed_name"] = "optimized_a_minus"
+    idx, note = ar.apply_probe_reference_gate(args, tasks, tried={(tuple([2, 2, 2, 2]), "reference"), (tuple([2, 2, 2, 2]), "optimized_a_minus")}, search_results=results, requested_idx=2)
+    assert idx == 2
+    assert note is None
+
+
+def test_near_feasible_continuation_prefers_same_nc_before_topology_hop() -> None:
+    args = make_args(screening_runs_per_nc=2, screening_runs_min_per_nc=2, screening_runs_max_per_nc=2)
+    tasks = [
+        {"nc": [2, 2, 2, 2], "seed_name": "reference", "seed": {"name": "reference"}, "screening_seed": True},
+        {"nc": [1, 3, 2, 2], "seed_name": "reference", "seed": {"name": "reference"}, "screening_seed": True},
+        {"nc": [2, 2, 2, 2], "seed_name": "optimized_a_minus", "seed": {"name": "optimized_a_minus"}, "screening_seed": True},
+        {"nc": [1, 3, 2, 2], "seed_name": "optimized_a_minus", "seed": {"name": "optimized_a_minus"}, "screening_seed": True},
+        {"nc": [2, 2, 2, 2], "seed_name": "optimized_b", "seed": {"name": "optimized_b"}, "screening_seed": False},
+        {"nc": [1, 3, 2, 2], "seed_name": "optimized_b", "seed": {"name": "optimized_b"}, "screening_seed": False},
+    ]
+    results = [
+        sample_result("run_a", feasible=False, status="solver_error", j=None, productivity=0.0061, purity=0.5999, rga=0.75, rma=0.75, violation=8e-7, nc=[2, 2, 2, 2]),
+        sample_result("run_b", feasible=False, status="solver_error", j=None, productivity=0.005, purity=0.58, rga=0.70, rma=0.72, violation=0.02, nc=[1, 3, 2, 2]),
+        sample_result("run_c", feasible=False, status="solver_error", j=None, productivity=0.0060, purity=0.5998, rga=0.749, rma=0.748, violation=9e-7, nc=[2, 2, 2, 2]),
+        sample_result("run_d", feasible=False, status="solver_error", j=None, productivity=0.0052, purity=0.59, rga=0.73, rma=0.74, violation=0.015, nc=[1, 3, 2, 2]),
+    ]
+    results[0]["seed_name"] = "reference"
+    results[1]["seed_name"] = "reference"
+    results[2]["seed_name"] = "optimized_a_minus"
+    results[3]["seed_name"] = "optimized_a_minus"
+    tried = {
+        ((2, 2, 2, 2), "reference"),
+        ((1, 3, 2, 2), "reference"),
+        ((2, 2, 2, 2), "optimized_a_minus"),
+        ((1, 3, 2, 2), "optimized_a_minus"),
+    }
+    idx, note = ar.near_feasible_continuation_select(args, tasks, tried, results)
+    assert idx == 4
+    assert note is not None
+    assert note["mode"] == "near_feasible_continuation"
+    assert note["anchor_nc"] == [2, 2, 2, 2]
+
+
+def test_check_systematic_infeasibility_not_triggered_for_near_feasible_boundary_window() -> None:
+    results = [
+        sample_result("run_1", feasible=False, status="solver_error", j=None, productivity=0.0061, purity=0.5999, rga=0.75, rma=0.75, violation=8e-7),
+        sample_result("run_2", feasible=False, status="solver_error", j=None, productivity=0.0062, purity=0.5998, rga=0.749, rma=0.749, violation=9e-7),
+        sample_result("run_3", feasible=False, status="solver_error", j=None, productivity=0.0060, purity=0.5997, rga=0.748, rma=0.748, violation=7e-7),
+    ]
+    state = ar.check_systematic_infeasibility(results, 3, near_feasible_violation_threshold=1e-5)
+    assert state["triggered"] is False
+    assert state["bad_count"] == 0
+    assert state["near_feasible_count"] == 3
+
+
+def test_search_execution_policy_applies_relaxed_solver_override_for_screening_phase(monkeypatch) -> None:
+    monkeypatch.setenv("SMB_SCREENING_IPOPT_MAX_ITER", "777")
+    monkeypatch.setenv("SMB_SCREENING_IPOPT_TOL", "0.0002")
+    monkeypatch.setenv("SMB_SCREENING_IPOPT_ACCEPTABLE_TOL", "0.002")
+    args = make_args(screening_runs_per_nc=2, screening_runs_min_per_nc=2, screening_runs_max_per_nc=2)
+    tasks = [
+        {"nc": [2, 2, 2, 2], "seed_name": "reference", "seed": {"name": "reference"}, "screening_seed": True},
+        {"nc": [2, 2, 2, 2], "seed_name": "optimized_a_minus", "seed": {"name": "optimized_a_minus"}, "screening_seed": True},
+        {"nc": [2, 2, 2, 2], "seed_name": "optimized_b", "seed": {"name": "optimized_b"}, "screening_seed": False},
+    ]
+    policy = ar.search_execution_policy(args, tasks, search_results=[], task=tasks[0])
+    assert policy["probe_phase_active"] is True
+    assert policy["solver_override"]["max_iter"] == 777
+    assert abs(policy["solver_override"]["tol"] - 0.0002) < 1e-12
+    assert abs(policy["solver_override"]["acceptable_tol"] - 0.002) < 1e-12
 
 
 def test_request_json_with_single_repair_requests_json_mode() -> None:

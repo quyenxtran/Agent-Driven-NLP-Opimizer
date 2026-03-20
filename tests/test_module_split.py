@@ -109,6 +109,7 @@ BRIDGE_SYMBOLS = {
         "apply_probe_reference_gate",
         "probe_reference_runs_required",
         "search_execution_policy",
+        "near_feasible_continuation_select",
         "deterministic_review",
         "single_scientist_policy_review",
         "executive_controller_decide",
@@ -668,6 +669,7 @@ class TestAgentRunnerDelegation:
         assert agent_runner.apply_probe_reference_gate is agent_policy.apply_probe_reference_gate
         assert agent_runner.probe_reference_runs_required is agent_policy.probe_reference_runs_required
         assert agent_runner.search_execution_policy is agent_policy.search_execution_policy
+        assert agent_runner.near_feasible_continuation_select is agent_policy.near_feasible_continuation_select
         assert agent_runner.single_scientist_policy_review is agent_policy.single_scientist_policy_review
         assert agent_runner.executive_controller_decide is agent_policy.executive_controller_decide
         assert agent_runner.physics_informed_select is agent_policy.physics_informed_select
