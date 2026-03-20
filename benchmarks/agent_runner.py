@@ -250,6 +250,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--objectives-file", default=os.environ.get("SMB_OBJECTIVES_FILE", str(REPO_ROOT / "agents" / "Objectives.md")))
     parser.add_argument("--llm-soul-file", default=os.environ.get("SMB_LLM_SOUL_FILE", str(REPO_ROOT / "agents" / "LLM_SOUL.md")))
+    parser.add_argument("--llm-soul-a-file", default=os.environ.get("SMB_LLM_SOUL_A_FILE", str(REPO_ROOT / "agents" / "LLM_SOUL_A.md")))
+    parser.add_argument("--llm-soul-b-file", default=os.environ.get("SMB_LLM_SOUL_B_FILE", str(REPO_ROOT / "agents" / "LLM_SOUL_B.md")))
+    parser.add_argument("--llm-soul-c-file", default=os.environ.get("SMB_LLM_SOUL_C_FILE", str(REPO_ROOT / "agents" / "LLM_SOUL_C.md")))
     parser.add_argument(
         "--problem-definition-file",
         default=os.environ.get("SMB_PROBLEM_DEFINITION_FILE", str(REPO_ROOT / "agents" / "Problem_definition.md")),
@@ -1067,14 +1070,26 @@ def request_json_with_single_repair(
         return data, raw, False, ""
 
     repair_reason = "missing required keys" if missing else "invalid JSON response"
+    placeholder: Dict[str, object] = {}
+    for k in required_keys:
+        if "index" in k:
+            placeholder[k] = 0
+        elif any(x in k for x in ("refs", "evidence", "comparison", "alternatives", "rationale")):
+            placeholder[k] = ["<your text here>"]
+        else:
+            placeholder[k] = "<your text here>"
+    example_json = json.dumps(placeholder, separators=(",", ":"))
     repair_prompt = textwrap.dedent(
         f"""
         Your previous response was invalid for role={conversation_role}.
         Failure reason: {repair_reason}.
         Required keys: {list(required_keys)}.
 
-        Return ONLY valid JSON object with all required keys and numeric fields preserved where requested.
-        Do not include markdown or analysis text.
+        Example of the required JSON structure (replace placeholder values with real content):
+        {example_json}
+
+        Return ONLY a valid JSON object with all required keys filled in.
+        Do not include markdown, analysis text, or any text outside the JSON object.
 
         Previous response:
         {str(raw or '')[:1400]}
@@ -1791,6 +1806,44 @@ def compact_prompt_block(text: str, max_chars: int = 2000, max_lines: int = 80) 
     if len(compacted) <= max_chars:
         return compacted
     return compacted[: max_chars - 1].rstrip() + "…"
+
+
+def budget_evidence_pack_json(evidence_pack: Dict[str, object], max_chars: int) -> str:
+    """Serialize evidence pack to JSON within max_chars by dropping complete records.
+
+    Unlike compact_prompt_block, this never slices mid-JSON-string — it removes
+    whole records from least-important sections first so the output is always
+    valid JSON the model can parse.
+    """
+    ep: Dict[str, object] = {
+        "recent_runs": list(evidence_pack.get("recent_runs", [])),
+        "top_feasible": list(evidence_pack.get("top_feasible", [])),
+        "top_infeasible": list(evidence_pack.get("top_infeasible", [])),
+        "run_name_catalog": list(evidence_pack.get("run_name_catalog", [])),
+    }
+    # Trim order: catalog (redundant), infeasible tail, feasible tail, recent tail
+    trim_order = [
+        ("run_name_catalog", -1),
+        ("top_infeasible", -1),
+        ("top_feasible", -1),
+        ("recent_runs", 0),
+    ]
+    for _ in range(40):
+        s = json.dumps(ep, separators=(",", ":"))
+        if len(s) <= max_chars:
+            return s
+        trimmed = False
+        for section, pop_index in trim_order:
+            lst = ep[section]
+            if isinstance(lst, list) and lst:
+                lst.pop(pop_index)
+                trimmed = True
+                break
+        if not trimmed:
+            break
+    # Last resort: hard truncate at a JSON-safe char boundary (still valid outer object)
+    s = json.dumps(ep, separators=(",", ":"))
+    return s[:max_chars]
 
 
 def markdown_focused_excerpt(
@@ -3395,7 +3448,7 @@ def scientist_a_pick(
 
     evidence_pack = build_evidence_pack(results, recent_limit=5, feasible_limit=3, infeasible_limit=4)
     evidence_run_names = [str(item) for item in evidence_pack.get("run_name_catalog", [])]
-    evidence_compact = compact_prompt_block(json.dumps(evidence_pack, separators=(",", ":")), max_chars=1100, max_lines=30)
+    evidence_compact = budget_evidence_pack_json(evidence_pack, max_chars=1100)
 
     best = rank_any_results(results)[0] if results else None
     recent_two_block, recent_two_labels = recent_two_run_review_context(results)
@@ -3869,20 +3922,25 @@ def scientist_b_review(
     current_priorities: List[str],
     sqlite_context_excerpt: str,
     iteration: int,
+    soul_excerpt: str = "",
+    heuristics_context: str = "",
 ) -> Dict[str, object]:
     default = deterministic_review(task, best_result)
     prompt_warning = ""
     recent_two_block, recent_two_labels = recent_two_run_review_context(results)
     evidence_pack = build_evidence_pack(results, recent_limit=5, feasible_limit=3, infeasible_limit=4)
     evidence_run_names = [str(item) for item in evidence_pack.get("run_name_catalog", [])]
-    evidence_compact = compact_prompt_block(json.dumps(evidence_pack, separators=(",", ":")), max_chars=1100, max_lines=30)
-    codebase_compact = compact_prompt_block(codebase_context_excerpt, max_chars=420, max_lines=16)
-    compute_compact = compact_prompt_block(compute_context_excerpt, max_chars=260, max_lines=12)
-    constraint_compact = compact_prompt_block(constraint_context_excerpt, max_chars=420, max_lines=16)
-    nc_strategy_compact = compact_prompt_block(nc_strategy_excerpt, max_chars=520, max_lines=18)
-    research_compact = compact_prompt_block(research_excerpt, max_chars=320, max_lines=12)
-    sqlite_compact = compact_prompt_block(sqlite_context_excerpt, max_chars=520, max_lines=18)
-    recent_two_compact = compact_prompt_block(recent_two_block, max_chars=420, max_lines=16)
+    evidence_compact = budget_evidence_pack_json(evidence_pack, max_chars=5000)
+    codebase_compact = compact_prompt_block(codebase_context_excerpt, max_chars=1500, max_lines=50)
+    compute_compact = compact_prompt_block(compute_context_excerpt, max_chars=1000, max_lines=35)
+    constraint_compact = compact_prompt_block(constraint_context_excerpt, max_chars=1500, max_lines=50)
+    nc_strategy_compact = compact_prompt_block(nc_strategy_excerpt, max_chars=2000, max_lines=60)
+    research_compact = compact_prompt_block(research_excerpt, max_chars=2000, max_lines=60)
+    sqlite_compact = compact_prompt_block(sqlite_context_excerpt, max_chars=3000, max_lines=90)
+    recent_two_compact = compact_prompt_block(recent_two_block, max_chars=1500, max_lines=50)
+    soul_compact = compact_prompt_block(soul_excerpt, max_chars=2500, max_lines=70)
+    heuristics_compact = compact_prompt_block(heuristics_context, max_chars=2000, max_lines=60)
+    failure_compact = compact_prompt_block(heuristics_context, max_chars=1000, max_lines=35)
     priorities_compact = "\n".join(f"- {p}" for p in current_priorities[:6]) or "- none"
     proposed_task_brief = {"nc": list(task.get("nc", [])), "seed_name": str(task.get("seed_name", ""))}
     effective_task_brief = {
@@ -3897,6 +3955,9 @@ def scientist_b_review(
             Be adversarial and skeptical by default.
             Reject if rationale is generic, evidence is weak, or compute/constraint tradeoffs are ignored.
             You must explicitly compare the proposal against previous results before deciding.
+
+            Reviewer operating principles:
+            {soul_compact}
             If you approve, still provide the strongest counterarguments and explicit risk checks.
 
             Proposed task:
@@ -3928,6 +3989,12 @@ def scientist_b_review(
 
             Current priority board:
             {priorities_compact}
+
+            Known failure modes (avoid repeating these patterns):
+            {failure_compact}
+
+            Heuristics and hypotheses context:
+            {heuristics_compact}
 
             Historical simulation context (queried from SQLite):
             {sqlite_compact}
@@ -3961,7 +4028,7 @@ def scientist_b_review(
             }}
             """
         ).strip()
-        prompt = compact_prompt_block(prompt, max_chars=2800, max_lines=95)
+        prompt = compact_prompt_block(prompt, max_chars=22000, max_lines=660)
     except Exception as exc:
         prompt_warning = f"Prompt build warning: {type(exc).__name__}: {exc}"
         prompt = (
@@ -4301,6 +4368,8 @@ def scientist_c_arbitrate(
     *,
     revision_count_recent: int = 0,
     force_diagnostic_reason: str = "",
+    soul_excerpt: str = "",
+    nc_strategy_excerpt: str = "",
 ) -> Dict[str, object]:
     default_counterproposal = b_note.get("counterproposal_run") if isinstance(b_note.get("counterproposal_run"), dict) else None
     default_decision = "IMPLEMENT_B_COUNTER" if default_counterproposal else "IMPLEMENT_A"
@@ -4308,12 +4377,14 @@ def scientist_c_arbitrate(
     recent_two_block, _ = recent_two_run_review_context(results)
     hypothesis_compact = hypothesis_matcher(heuristics_context, results)
     failure_compact = failure_recovery_context(heuristics_context, results)
-    recent_two_compact = compact_prompt_block(recent_two_block, max_chars=420, max_lines=16)
-    heuristics_compact = compact_prompt_block(heuristics_context, max_chars=520, max_lines=18)
-    sqlite_compact = compact_prompt_block(sqlite_context_excerpt, max_chars=520, max_lines=18)
+    recent_two_compact = compact_prompt_block(recent_two_block, max_chars=1500, max_lines=50)
+    heuristics_compact = compact_prompt_block(heuristics_context, max_chars=1500, max_lines=50)
+    sqlite_compact = compact_prompt_block(sqlite_context_excerpt, max_chars=3000, max_lines=90)
+    soul_compact = compact_prompt_block(soul_excerpt, max_chars=2500, max_lines=70)
+    nc_strategy_compact = compact_prompt_block(nc_strategy_excerpt, max_chars=2000, max_lines=60)
     evidence_pack = build_evidence_pack(results, recent_limit=5, feasible_limit=3, infeasible_limit=4)
     evidence_run_names = [str(item) for item in evidence_pack.get("run_name_catalog", [])]
-    evidence_compact = compact_prompt_block(json.dumps(evidence_pack, separators=(",", ":")), max_chars=1100, max_lines=30)
+    evidence_compact = budget_evidence_pack_json(evidence_pack, max_chars=5000)
     priorities_compact = "\n".join(f"- {p}" for p in current_priorities[:6]) or "- none"
     a_brief = {
         "decision": str(a_note.get("decision", "")).strip(),
@@ -4364,6 +4435,9 @@ def scientist_c_arbitrate(
             You are Scientist_C, the executive arbiter for SMB search.
             Choose exactly one taxonomy label:
             IMPLEMENT_A, IMPLEMENT_B_COUNTER, IMPLEMENT_HYBRID, RETURN_FOR_REVISION, FORCE_DIAGNOSTIC.
+
+            Arbitration protocol:
+            {soul_compact}
             Be strict about physics, evidence quality, and budget impact.
             If the B counterproposal is weak or inconsistent, prefer revision or diagnostic over blind execution.
 
@@ -4384,6 +4458,9 @@ def scientist_c_arbitrate(
 
             Current priority board:
             {priorities_compact}
+
+            NC strategy board (layout history — use to arbitrate topology disagreements):
+            {nc_strategy_compact}
 
             Hypotheses:
             {hypothesis_compact}
@@ -4417,7 +4494,7 @@ def scientist_c_arbitrate(
             }}
             """
         ).strip()
-        prompt = compact_prompt_block(prompt, max_chars=2600, max_lines=90)
+        prompt = compact_prompt_block(prompt, max_chars=20000, max_lines=600)
         data, raw, _repaired, _repair_error = request_json_with_single_repair(
             exec_client,
             system_prompt="You are a decisive process executive. Return JSON only.",
@@ -4830,14 +4907,40 @@ def main() -> int:
         max_lines=150,
     )
     soul_excerpt = markdown_focused_excerpt(
-        args.llm_soul_file,
+        args.llm_soul_a_file if Path(args.llm_soul_a_file).exists() else args.llm_soul_file,
         heading_keywords=(
             "role",
             "core principle",
             "acquisition strategy protocol",
             "mandatory deep review",
-            "what scientist_b must check",
+            "compute and fidelity policy",
             "when to stop",
+            "reporting style",
+        ),
+        max_chars=args.llm_soul_max_chars,
+        max_lines=130,
+    )
+    soul_b_excerpt = markdown_focused_excerpt(
+        args.llm_soul_b_file if Path(args.llm_soul_b_file).exists() else args.llm_soul_file,
+        heading_keywords=(
+            "role",
+            "core principle",
+            "mandatory deep review",
+            "what scientist_b must check",
+            "counterproposal standard",
+            "evaluation skills",
+            "reporting style",
+        ),
+        max_chars=args.llm_soul_max_chars,
+        max_lines=130,
+    )
+    soul_c_excerpt = markdown_focused_excerpt(
+        args.llm_soul_c_file if Path(args.llm_soul_c_file).exists() else args.llm_soul_file,
+        heading_keywords=(
+            "role",
+            "core principle",
+            "scientist_executive moderation protocol",
+            "decision skills",
             "reporting style",
         ),
         max_chars=args.llm_soul_max_chars,
@@ -5492,6 +5595,8 @@ def main() -> int:
                         current_priorities,
                         sqlite_excerpt,
                         search_iteration,
+                        soul_excerpt=soul_b_excerpt,
+                        heuristics_context=heuristics_excerpt,
                     )
                     progress_log(f"AGENT: Scientist_B review done (iter={search_iteration})")
                 except Exception as exc:
@@ -5567,6 +5672,8 @@ def main() -> int:
                         1 for item in revision_iterations if item > search_iteration - 3
                     ),
                     force_diagnostic_reason=force_diagnostic_reason if force_diagnostic_next_iteration else "",
+                    soul_excerpt=soul_c_excerpt,
+                    nc_strategy_excerpt=nc_strategy_excerpt,
                 )
                 c_decision = str(c_note.get("decision", "")).strip().upper()
                 revision_recent_count = sum(1 for item in revision_iterations if item > search_iteration - 3)

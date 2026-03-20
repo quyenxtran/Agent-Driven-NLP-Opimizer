@@ -2,79 +2,64 @@
 
 ## Core Question
 
-Under fixed compute budget, find a high-productivity feasible SMB operating point for Kraton feed, and do it with a reliable search policy.
+Find a high-productivity, feasible SMB operating point for Kraton feed under a fixed compute budget, using a reproducible search policy.
 
 ## Optimization Problem
 
-Objective:
+**Objective:** maximize `productivity_ex_ga_ma`
 
-- maximize `productivity_ex_ga_ma`
+**Hard constraints:**
+- `purity_ex_meoh_free ≥ 0.60`
+- `recovery_ex_GA ≥ 0.75`
+- `recovery_ex_MA ≥ 0.75`
+- flow mass balance: `F1 = Fdes + Fex = Ffeed + Fraf` (±1%)
+- all flows within declared pump limits
+- `nc` layout admissible: `sum(nc) = 8`, all zones ≥ 1
 
-Constraints:
+**Decision variables:** `nc`, `Ffeed`, `F1`, `Fdes`, `Fex`, `tstep`
 
-- quality thresholds (runtime project targets)
-- flow bounds and pump limits
-- flow consistency: `F1 = Fdes + Fex = Ffeed + Fraf`
-- fixed hardware: 8 columns, `nc` must be admissible
+**Derived:** `Fraf = F1 − Ffeed` (not independently optimized)
 
-Main variables:
+## Problem Type
 
-- `nc`, `Ffeed`, `F1`, `Fdes`, `Fex`, `tstep`
+- Fixed `nc` → large nonconvex NLP
+- Variable `nc` → mixed discrete + continuous search
 
-Derived:
+A global optimum is not guaranteed with local NLP solvers (IPOPT). The target is the best validated solution found under finite budget.
 
-- `Fraf` (unless explicitly reformulated)
+## Search Philosophy
 
-## What Kind of Optimization Problem?
+**Feasibility first, optimization second, validation last.**
 
-- fixed `nc`: large nonconvex NLP
-- variable `nc`: mixed discrete+continuous search
-
-Global optimum is not guaranteed with local NLP solvers; target is best validated solution under finite budget.
-
-## Practical Benchmark Framing
-
-Hold constant across methods:
-
-- model/feed assumptions
-- NC library
-- bounds/constraints
-- final high-fidelity validator
-
-Compare methods by:
-
-- feasibility rate
-- best validated productivity
-- time/evals to best feasible
-- robustness of final point
+Do not exploit a region that has never produced a feasible run. Do not commit to high-fidelity evaluation without low-fidelity evidence. Do not claim a result without high-fidelity validation.
 
 ## Fixed-Budget Rule
 
-Respect exported job budget. Reserve final validation budget; do not spend it early without justification.
+Respect the job's exported time budget. Reserve validation budget (≈ final 20–25%) for high-fidelity confirmation. Do not spend validation runs during early screening.
 
-## Five-Hour Benchmark Protocol
+## Benchmark Fairness
 
-If using 5h mode:
+Hold constant across all methods compared:
+- model and feed chemistry
+- NC library
+- flow bounds and quality constraints
+- final high-fidelity validator (nfex=10, nfet=5, ncp=2)
 
-- 4h search/refinement
-- 1h final validation
+Compare methods by:
+- feasibility rate (fraction of runs producing feasible result)
+- best validated `productivity_ex_ga_ma`
+- evaluations and wall time to first feasible solution
+- robustness of final operating point (sensitivity to small flow perturbations)
 
-## Recommended Success Criteria
+## Minimum Evidence for a Final Claim
 
-Strong result includes:
+A result is claimable only when all of the following exist:
 
-- feasible high-fidelity candidate meeting targets
-- strong productivity
-- evidence-backed competitor comparisons
-- reproducibility metadata (solver/profile/run IDs)
-
-## Minimal Evidence For Final Claim
-
-- final high-fidelity metrics
-- at least two meaningful competitor comparisons
-- explicit nearby failure-mode discussion
-- local perturbation/sensitivity evidence
+1. High-fidelity run (`nfex=10, nfet=5, ncp=2`) that is feasible with all constraints met
+2. Numeric comparison to at least two competitor runs (different `nc` or seed)
+3. Explicit discussion of the nearest failure mode (what change breaks feasibility)
+4. Reproducibility metadata: run name, solver profile, SQLite record, artifact path
 
 ## Bottom Line
 
-Feasibility first, optimization second, validation last, claims only from evidence.
+Feasibility first → constraint satisfaction → productivity maximization → validated claim.

@@ -1,131 +1,84 @@
-# SMB Optimization Objective
+# SMB Optimization Objectives
 
-## Mission
+## Maximize
 
-Use local `sembasmb` as source of truth. Optimize Kraton-feed SMB by selecting:
+```
+productivity_ex_ga_ma = (CE_GA + CE_MA) * UE * area * eb
+```
 
-- operating variables: `F1`, `Fdes`, `Fex`, `Ffeed`, `tstep`
-- layout: `nc` over fixed 8 columns
-- fidelity/solver strategy for reproducible search
+No chemistry or hardware redesign. Optimize only operating variables and layout.
 
-No chemistry/hardware redesign unless explicitly requested.
+## Hard Constraints (non-negotiable)
 
-## Optimization Goal
+| Constraint | Threshold |
+|---|---|
+| `purity_ex_meoh_free` | ≥ 0.60 |
+| `recovery_ex_GA` | ≥ 0.75 |
+| `recovery_ex_MA` | ≥ 0.75 |
+| `F1 = Fdes + Fex` | ±1% mass balance |
+| `F1 = Ffeed + Fraf` | ±1% mass balance |
+| All flows > 0 | strict positivity |
 
-Maximize:
+Any candidate that violates mass balance or cannot plausibly reach these targets is infeasible — reject it before running.
 
-- `productivity_ex_ga_ma = (CE_GA + CE_MA) * UE * area * eb`
+## Decision Variables
 
-Subject to runtime bounds and hard constraints.
+Optimize: `nc`, `F1`, `Fdes`, `Fex`, `Ffeed`, `tstep`
 
-## Components and Basis
+Derived (not a free variable): `Fraf = F1 − Ffeed`
 
-Fixed component order:
+## Flow Bounds (runtime-configurable defaults)
 
-1. `GA`
-2. `MA`
-3. `Water`
-4. `MeOH`
+- `0.5 ≤ Ffeed ≤ 2.5` mL/min
+- `Fdes, Fex ≤ 2.5` mL/min (max pump flow)
+- `Fraf ≤ 5.0` mL/min (raffinate pump cap)
+- `F1 ≤ 5.0` mL/min
 
-Kraton feed defaults:
+## NC Layout
 
-- `wt0 = (0.003, 0.004, 0.990, 0.003)`
-- `rho = (1.5, 1.6, 1.0, 0.79)`
-- `CF = wt0 / sum(wt0 / rho)`
+- Total columns: **8** (fixed hardware)
+- `nc = (Z1, Z2, Z3, Z4)` where `sum(nc) = 8`, all zones ≥ 1
+- Reference layout: `nc = (1, 2, 3, 2)`
 
-## Desorbent Composition
+## Feed and Desorbent Chemistry
 
-Default desorbent is pure MeOH:
+Kraton feed (mass fractions): `wt0 = (GA=0.003, MA=0.004, Water=0.990, MeOH=0.003)`
 
-- mass fraction `(0,0,0,1)`
+Feed concentration: `CF = wt0 / sum(wt0 / rho)` where `rho = (1.5, 1.6, 1.0, 0.79) g/mL`
 
-## SMB Configuration
+Desorbent: pure MeOH `(0, 0, 0, 1)` mass fraction
 
-Reference:
+## Fidelity Ladder
 
-- total columns: `8`
-- reference `nc = (1,2,3,2)`
-- high-fidelity mesh: `nfex=10, nfet=5, ncp=2`
+| Level | nfex | nfet | ncp | Use |
+|---|---|---|---|---|
+| Low | 4–5 | 2 | 1 | Layout screening, first feasibility |
+| Medium | 6 | 3 | 2 | Candidate refinement |
+| High | 10 | 5 | 2 | Final validation only |
 
-Layout rule:
+Never jump from low to high directly. A high-fidelity run is only justified if a low-fidelity feasible result already exists for that `nc`.
 
-- `sum(nc)=8`
-- no zero-column zones
+## Required Search Workflow
 
-## Decision Variables vs Derived Quantities
+1. **Screen** — cover all NC layouts with reference seed at low fidelity
+2. **Rank** — compare productivity/purity/recovery/violation across layouts
+3. **Refine** — perturb flows around top feasible candidates at medium fidelity
+4. **Validate** — promote best candidate to high fidelity; confirm all constraints met
+5. **Claim** — report only results with high-fidelity evidence
 
-Optimize:
+## Simulation Priority Order
 
-- `nc`, `F1`, `Fdes`, `Fex`, `Ffeed`, `tstep`
+1. Reduce `normalized_total_violation` (feasibility first)
+2. Meet quality constraints (`purity`, `recovery_GA`, `recovery_MA`)
+3. Maximize `productivity_ex_ga_ma` inside the feasible region
 
-Derived unless reformulated:
+## Mandatory Evidence per Iteration
 
-- `Fraf`
+Every proposal must include:
 
-Flow invariants:
+- numeric comparison vs at least one prior run (productivity, purity, recovery, violation)
+- flow deltas: `ΔFfeed, ΔF1, ΔFdes, ΔFex, ΔFraf, Δtstep`
+- topology deltas: `ΔZ1, ΔZ2, ΔZ3, ΔZ4`
+- explicit physics rationale (zone I–IV mechanics, selectivity, mass balance)
 
-- `F1 = Fdes + Fex`
-- `F1 = Ffeed + Fraf`
-
-## Hard Operating Constraints
-
-Use runtime-exported bounds; defaults:
-
-- `0.5 <= Ffeed <= 2.5` mL/min
-- external streams `<= 2.5` mL/min
-- `F1 <= 5.0` mL/min
-- all flows positive
-
-Project defaults:
-
-- `purity_ex_meoh_free >= 0.60`
-- `recovery_ex_GA >= 0.75`
-- `recovery_ex_MA >= 0.75`
-
-## Required Workflow
-
-1. Solver/model check and baseline feasibility.
-2. Screen all NC with reference seed.
-3. Expand seeds/flows only after layout evidence.
-4. Refine top feasible candidates.
-5. Final high-fidelity validation for claims.
-
-## Mandatory NC-Coverage and Comparative Reasoning
-
-Before deep exploitation:
-
-- cover active NC library with reference seed probes
-- compare against current best and recent failure
-- include numeric evidence: productivity/purity/recovery/violation
-- include flow deltas: `dFfeed,dF1,dFdes,dFex,dFraf,dtstep`
-- include topology deltas: `dZ1,dZ2,dZ3,dZ4`
-
-## Insights and Trends Ledger
-
-Each iteration logs:
-
-- chosen candidate and why
-- metric comparison vs prior runs
-- physics interpretation
-- next hypothesis
-
-## Simulation Priority Policy
-
-Priority order:
-
-1. feasibility and violation reduction
-2. quality constraints
-3. productivity inside feasible region
-
-## LLM Runtime and Fallback Policy
-
-- local model first when enabled
-- concise evidence-first prompts
-- deterministic fallback when LLM unavailable
-
-## Final Deliverables
-
-- best validated candidate (`nc`, flows, fidelity, solver profile)
-- objective/constraint metrics
-- comparison vs alternatives/failures
-- reproducibility metadata (run name, sqlite/artifacts, solver settings)
+Generic text without run-name references and numeric values is rejected.
