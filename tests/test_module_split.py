@@ -7,6 +7,7 @@ Tests verifying that the benchmarks module split is correct:
 """
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 
@@ -15,6 +16,70 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SMB_SRC = str(REPO_ROOT / "src")
 if SMB_SRC not in sys.path:
     sys.path.insert(0, SMB_SRC)
+
+
+BRIDGE_SYMBOLS = {
+    "agent_llm_client": [
+        "utc_now_text",
+        "required_keys_missing",
+        "OpenAICompatClient",
+        "request_json_with_single_repair",
+    ],
+    "agent_results": [
+        "as_float",
+        "layout_text",
+        "extract_metrics_with_validity",
+        "effective_flow",
+        "effective_violation",
+        "summarize_result",
+        "recent_two_run_review_context",
+        "rank_any_results",
+        "deterministic_select",
+    ],
+    "agent_evidence": [
+        "normalize_text_list",
+        "build_evidence_pack",
+        "contains_run_reference",
+        "coerce_evidence_list",
+        "coerce_grounded_evidence_refs",
+        "evidence_refs_are_grounded",
+        "compact_prompt_block",
+        "budget_evidence_pack_json",
+        "hypothesis_matcher",
+        "failure_recovery_context",
+    ],
+    "agent_db": [
+        "open_sqlite_db",
+        "persist_result_to_sqlite",
+        "record_convergence_snapshot",
+        "sqlite_history_context",
+        "sqlite_record_count",
+        "sqlite_layout_trend_table",
+        "read_research_tail",
+        "append_research",
+        "append_iteration_research",
+        "append_result_research",
+        "merge_priority_board",
+    ],
+    "agent_policy": [
+        "configure_stage_args",
+        "build_search_tasks",
+        "apply_probe_reference_gate",
+        "probe_reference_runs_required",
+        "search_execution_policy",
+        "single_scientist_policy_review",
+        "executive_controller_decide",
+        "physics_informed_select",
+        "check_systematic_infeasibility",
+    ],
+    "agent_scientists": [
+        "default_initial_priority_plan",
+        "initial_priority_plan",
+        "scientist_a_pick",
+        "scientist_b_review",
+        "scientist_c_arbitrate",
+    ],
+}
 
 
 class TestAgentResultsImports:
@@ -518,6 +583,29 @@ class TestCrossModuleConsistency:
 
 
 class TestAgentRunnerDelegation:
+    def test_agent_runner_bridge_covers_all_expected_symbols(self):
+        from benchmarks import agent_runner
+        from benchmarks import agent_db
+        from benchmarks import agent_evidence
+        from benchmarks import agent_llm_client
+        from benchmarks import agent_policy
+        from benchmarks import agent_results
+        from benchmarks import agent_scientists
+
+        modules = {
+            "agent_db": agent_db,
+            "agent_evidence": agent_evidence,
+            "agent_llm_client": agent_llm_client,
+            "agent_policy": agent_policy,
+            "agent_results": agent_results,
+            "agent_scientists": agent_scientists,
+        }
+        for module_name, symbols in BRIDGE_SYMBOLS.items():
+            module = modules[module_name]
+            for symbol in symbols:
+                assert hasattr(agent_runner, symbol)
+                assert getattr(agent_runner, symbol) is getattr(module, symbol)
+
     def test_agent_runner_uses_split_scientist_entrypoints(self):
         from benchmarks import agent_runner
         from benchmarks import agent_scientists
@@ -573,3 +661,44 @@ class TestAgentRunnerDelegation:
 
         assert agent_runner.OpenAICompatClient is agent_llm_client.OpenAICompatClient
         assert agent_runner.request_json_with_single_repair is agent_llm_client.request_json_with_single_repair
+
+
+class TestSplitModuleImportGraph:
+    def test_split_modules_remain_acyclic(self):
+        module_names = [
+            "agent_runner",
+            "agent_db",
+            "agent_evidence",
+            "agent_llm_client",
+            "agent_policy",
+            "agent_results",
+            "agent_scientists",
+        ]
+        graph = {name: set() for name in module_names}
+        for name in module_names:
+            path = REPO_ROOT / "benchmarks" / f"{name}.py"
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                if node.level != 1 or node.module is None:
+                    continue
+                target = node.module
+                if target in graph:
+                    graph[name].add(target)
+
+        visiting = set()
+        visited = set()
+
+        def visit(node: str) -> None:
+            if node in visited:
+                return
+            assert node not in visiting, f"Import cycle detected at {node}: {graph}"
+            visiting.add(node)
+            for neighbor in graph[node]:
+                visit(neighbor)
+            visiting.remove(node)
+            visited.add(node)
+
+        for node in graph:
+            visit(node)
